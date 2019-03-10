@@ -28,11 +28,11 @@ release-pi:
 	mv dist.deb lomo-vips-pi.deb
 
 install-dep-linux: 
-	sudo apt install -y libexif12 libjpeg-dev libpng16-16 libglib2.0-dev libexpat1 libfftw3-bin liblcms2-2 libde265-0 libffi7 libpcre3 libheif-dev gobject-introspection gir1.2-vips-8.0
+	sudo apt install -y libexif12 libjpeg-dev libpng16-16 libglib2.0-dev libexpat1 libfftw3-bin liblcms2-2 libde265-0 libffi7 libpcre3 libheif-dev gobject-introspection gir1.2-vips-8.0 libwebp-dev libwebp6, libwebpmux3, libwebpdemux2 libtiff-dev
 
 build-linux: clean
 	mkdir -p ${DIST}/usr
-	cd ../; ./configure --prefix=${DIST}/usr --without-gsf  --without-magick  --without-OpenEXR --without-nifti --without-pdfium  --without-poppler --without-rsvg --without-openslide --without-matio  --without-cfitsio --without-libwebp --without-pangoft2 --without-tiff --without-giflib --without-imagequant; make; make install
+	cd ../; ./configure --prefix=${DIST}/usr --without-gsf  --without-magick  --without-OpenEXR --without-nifti --without-pdfium  --without-poppler --without-rsvg --without-openslide --without-matio  --without-cfitsio --without-pangoft2 --without-imagequant --with-libheif --with-libwebp --with-tiff --with-giflib --with-png --with-jpeg; make; make install
 
 release-linux-amd64:
 	cp -r linux-amd64/DEBIAN ${DIST}
