@@ -1,6 +1,6 @@
 .PHONY: vendor
 
-DIST=./dist
+DIST=${PWD}/dist
 
 clean:
 	rm -rf ${DIST} *.deb
@@ -34,7 +34,12 @@ build-linux: clean
 	mkdir -p ${DIST}/usr
 	cd ../; ./configure --prefix=${DIST}/usr --without-gsf  --without-magick  --without-OpenEXR --without-nifti --without-pdfium  --without-poppler --without-rsvg --without-openslide --without-matio  --without-cfitsio --without-libwebp --without-pangoft2 --without-tiff --without-giflib --without-imagequant; make; make install
 
-release-linux: 
-	cp -r linux/DEBIAN ${DIST}
+release-linux-amd64:
+	cp -r linux-amd64/DEBIAN ${DIST}
 	dpkg-deb --build dist
-	mv dist.deb lomo-vips-linux.deb
+	mv dist.deb lomo-vips-linux-amd64.deb
+
+release-linux-armhf:
+	cp -r linux-armhf/DEBIAN ${DIST}
+	dpkg-deb --build dist
+	mv dist.deb lomo-vips-linux-armhf.deb
