@@ -1460,7 +1460,7 @@ vips_object_real_build( VipsObject *object )
 }
 
 static int
-vips_object_real_postbuild( VipsObject *object )
+vips_object_real_postbuild( VipsObject *object, void *data )
 {
 #ifdef DEBUG
 	printf( "vips_object_real_postbuild: " ); 
@@ -1701,7 +1701,7 @@ traverse_find_required_priority( void *data, void *a, void *b )
 }
 
 static gint
-traverse_sort( gconstpointer a, gconstpointer b )
+traverse_sort( gconstpointer a, gconstpointer b, void *user_data )
 {
 	VipsArgumentClass *class1 = (VipsArgumentClass *) a;
 	VipsArgumentClass *class2 = (VipsArgumentClass *) b;
@@ -1803,7 +1803,7 @@ vips_object_class_install_argument( VipsObjectClass *object_class,
 	argument_table_traverse = g_slist_prepend(
 		argument_table_traverse, argument_class );
 	argument_table_traverse = g_slist_sort(
-		argument_table_traverse, traverse_sort );
+		argument_table_traverse, (GCompareFunc) traverse_sort );
 	VIPS_SWAP( GSList *, 
 		argument_table_traverse, 
 		object_class->argument_table_traverse ); 
@@ -2176,6 +2176,17 @@ vips_object_print_arg( VipsObject *object, GParamSpec *pspec, VipsBuf *buf )
 	g_value_unset( &value );
 }
 
+/* Is a filename a target, ie. it is of the form ".jpg". Any trailing options 
+ * have already been stripped. Watch out for cases like "./x.jpg".
+ */
+static gboolean
+vips_filename_istarget( const char *filename )
+{
+	const char *p;
+
+	return( (p = strrchr( filename, '.' )) && p == filename );
+}
+
 /* Write a named arg to the string. If the arg does not need a string (see
  * above), arg will be NULL.
  */
@@ -2209,7 +2220,7 @@ vips_object_get_argument_to_string( VipsObject *object,
 
 		vips__filename_split8( arg, filename, option_string );
 
-		if( vips_isprefix( ".", filename ) ) {
+		if( vips_filename_istarget( filename ) ) {
 			VipsTarget *target;
 
 			if( !(target = vips_target_new_to_descriptor( 1 )) )
@@ -3045,7 +3056,7 @@ typedef struct {
 } VipsObjectLocal;
 
 static void
-vips_object_local_array_cb( GObject *parent, VipsObjectLocal *local )
+vips_object_local_array_cb( VipsObject *parent, VipsObjectLocal *local )
 {
 	int i;
 
@@ -3111,7 +3122,7 @@ vips_object_set_static( VipsObject *object, gboolean static_object )
 }
 
 static void *
-vips_object_n_static_cb( VipsObject *object, int *n )
+vips_object_n_static_cb( VipsObject *object, int *n, void *b )
 {
 	if( object->static_object )
 		*n += 1;
@@ -3132,7 +3143,7 @@ vips_object_n_static( void )
 }
 
 static void *
-vips_object_print_all_cb( VipsObject *object, int *n )
+vips_object_print_all_cb( VipsObject *object, int *n, void *b )
 {
 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
 
@@ -3176,7 +3187,7 @@ vips_object_print_all( void )
 }
 
 static void *
-vips_object_sanity_all_cb( VipsObject *object )
+vips_object_sanity_all_cb( VipsObject *object, void *a, void *b )
 {
 	(void) vips_object_sanity( object );
 

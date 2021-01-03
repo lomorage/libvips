@@ -92,6 +92,10 @@
  * 	- ignore large XMP
  * 14/10/19
  * 	- revise for target IO
+ * 18/2/20 Elad-Laufer
+ * 	- add subsample_mode, deprecate no_subsample
+ * 13/9/20
+ * 	- only write JFIF resolution if we don't have EXIF
  */
 
 /*
@@ -233,8 +237,10 @@ write_new( VipsImage *in )
 	write->eman.fp = NULL;
 	write->inverted = NULL;
 
-	if( vips_copy( in, &write->in, NULL ) ||
-		vips__exif_update( write->in ) ) { 
+	/* Make a copy of the input image since we may modify it with
+	 * vips__exif_update() etc.
+	 */
+	if( vips_copy( in, &write->in, NULL ) ) {
 		write_destroy( write );
 		return( NULL );
 	}
@@ -408,6 +414,59 @@ write_profile_data (j_compress_ptr cinfo,
   }
 }
 
+#ifndef HAVE_EXIF
+/* Set the JFIF resolution from the vips xres/yres tags.
+ */
+static void
+vips_jfif_resolution_from_image( struct jpeg_compress_struct *cinfo, 
+	VipsImage *image )
+{
+	int xres, yres;
+	const char *p;
+	int unit;
+
+	/* Default to inches, more progs support it.
+	 */
+	unit = 1;
+	if( vips_image_get_typeof( image, VIPS_META_RESOLUTION_UNIT ) &&
+		!vips_image_get_string( image, 
+			VIPS_META_RESOLUTION_UNIT, &p ) ) {
+		if( vips_isprefix( "cm", p ) ) 
+			unit = 2;
+		else if( vips_isprefix( "none", p ) ) 
+			unit = 0;
+	}
+
+	switch( unit ) {
+	case 0:
+		xres = VIPS_RINT( image->Xres );
+		yres = VIPS_RINT( image->Yres );
+		break;
+
+	case 1:
+		xres = VIPS_RINT( image->Xres * 25.4 );
+		yres = VIPS_RINT( image->Yres * 25.4 );
+		break;
+
+	case 2:
+		xres = VIPS_RINT( image->Xres * 10.0 );
+		yres = VIPS_RINT( image->Yres * 10.0 );
+		break;
+
+	default:
+		g_assert_not_reached();
+		break;
+	}
+
+	VIPS_DEBUG_MSG( "vips_jfif_resolution_from_image: "
+		"setting xres = %d, yres = %d, unit = %d\n", xres, yres, unit );
+
+	cinfo->density_unit = unit;
+	cinfo->X_density = xres;
+	cinfo->Y_density = yres;
+}
+#endif /*HAVE_EXIF*/
+
 /* Write an ICC Profile from a file into the JPEG stream.
  */
 static int
@@ -479,8 +538,9 @@ write_jpeg_block( VipsRegion *region, VipsRect *area, void *a )
 static int
 write_vips( Write *write, int qfac, const char *profile, 
 	gboolean optimize_coding, gboolean progressive, gboolean strip, 
-	gboolean no_subsample, gboolean trellis_quant,
-	gboolean overshoot_deringing, gboolean optimize_scans, int quant_table )
+	gboolean trellis_quant, gboolean overshoot_deringing,
+	gboolean optimize_scans, int quant_table,
+	VipsForeignJpegSubsample subsample_mode )
 {
 	VipsImage *in;
 	J_COLOR_SPACE space;
@@ -627,32 +687,40 @@ write_vips( Write *write, int qfac, const char *profile,
 	if( progressive ) 
 		jpeg_simple_progression( &write->cinfo ); 
 
-	/* Turn off chroma subsampling. Follow IM and do it automatically for
-	 * high Q. 
-	 */
-	if( no_subsample ||
-		qfac >= 90 ) { 
+	if( subsample_mode == VIPS_FOREIGN_JPEG_SUBSAMPLE_OFF ||
+		(subsample_mode == VIPS_FOREIGN_JPEG_SUBSAMPLE_AUTO && 
+			qfac >= 90) ) {
 		int i;
 
-		for( i = 0; i < in->Bands; i++ ) { 
+		for( i = 0; i < in->Bands; i++ ) {
 			write->cinfo.comp_info[i].h_samp_factor = 1;
 			write->cinfo.comp_info[i].v_samp_factor = 1;
 		}
 	}
 
-	/* Don't write the APP0 JFIF headers if we are stripping.
+	/* Only write the JFIF headers if we are not stripping and we have no
+	 * EXIF. Some readers get confused if you set both.
 	 */
-	if( strip ) 
-		write->cinfo.write_JFIF_header = FALSE;
+	write->cinfo.write_JFIF_header = FALSE;
+#ifndef HAVE_EXIF
+	if( !strip ) {
+		vips_jfif_resolution_from_image( &write->cinfo,  write->in );
+		write->cinfo.write_JFIF_header = TRUE;
+	}
+#endif /*HAVE_EXIF*/
 
-	/* Build compress tables.
+	/* Write app0 and build compress tables.
 	 */
 	jpeg_start_compress( &write->cinfo, TRUE );
 
-	/* Write any APP markers we need.
+	/* All the other APP chunks come next.
 	 */
-	if( !strip ) { 
-		if( write_exif( write ) ||
+	if( !strip ) {
+		/* We need to rebuild the exif data block from any exif tags
+		 * on the image.
+		 */
+		if( vips__exif_update( write->in ) ||  
+			write_exif( write ) ||
 			write_xmp( write ) ||
 			write_blob( write, 
 				VIPS_META_IPTC_NAME, JPEG_APP0 + 13 ) )
@@ -661,13 +729,15 @@ write_vips( Write *write, int qfac, const char *profile,
 		/* A profile supplied as an argument overrides an embedded 
 		 * profile. 
 		 */
-		if( profile &&
-			write_profile_file( write, profile ) )
-			return( -1 );
-		if( !profile && 
-			vips_image_get_typeof( in, VIPS_META_ICC_NAME ) && 
-			write_profile_meta( write ) )
-			return( -1 );
+		if( profile ) {
+			if( write_profile_file( write, profile ) )
+				return( -1 );
+		}
+		else {
+			if( vips_image_get_typeof( in, VIPS_META_ICC_NAME ) && 
+				write_profile_meta( write ) )
+				return( -1 );
+		}
 	}
 
 	/* Write data. Note that the write function grabs the longjmp()!
@@ -774,8 +844,9 @@ int
 vips__jpeg_write_target( VipsImage *in, VipsTarget *target,
 	int Q, const char *profile, 
 	gboolean optimize_coding, gboolean progressive,
-	gboolean strip, gboolean no_subsample, gboolean trellis_quant,
-	gboolean overshoot_deringing, gboolean optimize_scans, int quant_table )
+	gboolean strip, gboolean trellis_quant,
+	gboolean overshoot_deringing, gboolean optimize_scans,
+	int quant_table, VipsForeignJpegSubsample subsample_mode)
 {
 	Write *write;
 
@@ -800,9 +871,9 @@ vips__jpeg_write_target( VipsImage *in, VipsTarget *target,
 	/* Convert! Write errors come back here as an error return.
 	 */
 	if( write_vips( write, 
-		Q, profile, optimize_coding, progressive, strip, no_subsample,
+		Q, profile, optimize_coding, progressive, strip,
 		trellis_quant, overshoot_deringing, optimize_scans, 
-		quant_table ) ) {
+		quant_table, subsample_mode ) ) {
 		write_destroy( write );
 		return( -1 );
 	}

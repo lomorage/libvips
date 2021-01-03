@@ -149,8 +149,10 @@ vips_foreign_save_magick_next_image( VipsForeignSaveMagick *magick )
 	}
 
 	if( !magick_set_image_size( image, 
-		im->Xsize, magick->page_height, magick->exception ) )
+		im->Xsize, magick->page_height, magick->exception ) ) {
+		magick_vips_error( class->nickname, magick->exception ); 
 		return( -1 );
+	}
 
 	/* Delay must be converted from milliseconds into centiseconds
 	 * as GIF image requires centiseconds.
@@ -591,9 +593,7 @@ vips_foreign_save_magick_buffer_build( VipsObject *object )
 		return( -1 );
 	}
 
-	/* obuf is a g_free() buffer, not vips_free().
-	 */
-	blob = vips_blob_new( (VipsCallbackFn) g_free, obuf, olen );
+	blob = vips_blob_new( (VipsCallbackFn) vips_area_free_cb, obuf, olen );
 	g_object_set( buffer, "buffer", blob, NULL );
 	vips_area_unref( VIPS_AREA( blob ) );
 

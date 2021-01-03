@@ -35,8 +35,12 @@
  * 	- redone with source/target
  * 	- sequential load, plus mmap for filename sources
  * 	- faster plus lower memory use
- * 02/02/2020
+ * 02/02/20
  * 	- ban max_vaue < 0 
+ * 27/6/20
+ * 	- add ppmload_source
+ * 22/11/20
+ * 	- fix msb_first default [ewelot]
  */
 
 /*
@@ -193,6 +197,21 @@ vips_foreign_load_ppm_dispose( GObject *gobject )
 		dispose( gobject );
 }
 
+static int
+vips_foreign_load_ppm_build( VipsObject *object )
+{
+	VipsForeignLoadPpm *ppm = (VipsForeignLoadPpm *) object;
+
+	if( ppm->source ) 
+		ppm->sbuf = vips_sbuf_new_from_source( ppm->source );
+
+	if( VIPS_OBJECT_CLASS( vips_foreign_load_ppm_parent_class )->
+		build( object ) )
+		return( -1 );
+
+	return( 0 );
+}
+
 /* Scan the header into our class.
  */
 static int
@@ -237,7 +256,7 @@ vips_foreign_load_ppm_parse_header( VipsForeignLoadPpm *ppm )
 
 	/* Default ... can be changed below for PFM images.
 	 */
-	ppm->msb_first = 0;
+	ppm->msb_first = 1;
 
 	/* Read in size.
 	 */
@@ -441,13 +460,24 @@ vips_foreign_load_ppm_generate_binary( VipsRegion *or,
 	for( y = 0; y < r->height; y++ ) {
 		VipsPel *q = VIPS_REGION_ADDR( or, 0, r->top + y );
 
-		size_t bytes_read;
+		size_t n_bytes;
 
-		bytes_read = vips_source_read( ppm->source, q, sizeof_line );
-		if( bytes_read != sizeof_line ) {
-			vips_error( class->nickname, 
-				"%s", _( "file truncated" ) );
-			return( -1 );
+		n_bytes = sizeof_line;
+		while( n_bytes > 0 ) {
+			gint64 bytes_read;
+
+			bytes_read = vips_source_read( ppm->source, 
+				q, sizeof_line );
+			if( bytes_read < 0 ) 
+				return( -1 );
+			if( bytes_read == 0 ) {
+				vips_error( class->nickname, 
+					"%s", _( "file truncated" ) );
+				return( -1 );
+			}
+
+			n_bytes -= bytes_read;
+			q += bytes_read;
 		}
 	}
 
@@ -492,23 +522,22 @@ vips_foreign_load_ppm_generate_1bit_binary( VipsRegion *or,
 	VipsImage *image = or->im;
 
 	int x, y;
-	int bits;
 
-	bits = VIPS_SBUF_GETC( ppm->sbuf );
 	for( y = 0; y < r->height; y++ ) {
 		VipsPel *q = VIPS_REGION_ADDR( or, 0, r->top + y );
 
+		int bits;
+
+		/* Not needed, but stop a compiler warning.
+		 */
+		bits = 0;
+
 		for( x = 0; x < image->Xsize; x++ ) {
+			if( (x & 7) == 0 )
+				bits = VIPS_SBUF_GETC( ppm->sbuf );
 			q[x] = (bits & 128) ? 0 : 255;
 			bits = VIPS_LSHIFT_INT( bits, 1 );
-			if( (x & 7) == 7 )
-				bits = VIPS_SBUF_GETC( ppm->sbuf );
 		}
-
-		/* Skip any unaligned bits at end of line.
-		 */
-		if( (x & 7) != 0 )
-			bits = VIPS_SBUF_GETC( ppm->sbuf );
 	}
 
 	return( 0 );
@@ -627,6 +656,7 @@ vips_foreign_load_ppm_class_init( VipsForeignLoadPpmClass *class )
 
 	object_class->nickname = "ppmload_base";
 	object_class->description = _( "load ppm base class" );
+	object_class->build = vips_foreign_load_ppm_build;
 
 	foreign_class->suffs = vips__ppm_suffs;
 
@@ -721,6 +751,65 @@ vips_foreign_load_ppm_file_init( VipsForeignLoadPpmFile *file )
 {
 }
 
+typedef struct _VipsForeignLoadPpmSource {
+	VipsForeignLoadPpm parent_object;
+
+	VipsSource *source;
+
+} VipsForeignLoadPpmSource;
+
+typedef VipsForeignLoadPpmClass VipsForeignLoadPpmSourceClass;
+
+G_DEFINE_TYPE( VipsForeignLoadPpmSource, vips_foreign_load_ppm_source,
+	vips_foreign_load_ppm_get_type() );
+
+static int
+vips_foreign_load_ppm_source_build( VipsObject *object )
+{
+	VipsForeignLoadPpm *ppm = (VipsForeignLoadPpm *) object;
+	VipsForeignLoadPpmSource *source = (VipsForeignLoadPpmSource *) object;
+
+	if( source->source ) {
+		ppm->source = source->source;
+		g_object_ref( ppm->source );
+	}
+
+	if( VIPS_OBJECT_CLASS( vips_foreign_load_ppm_source_parent_class )->
+		build( object ) )
+		return( -1 );
+
+	return( 0 );
+}
+
+static void
+vips_foreign_load_ppm_source_class_init( VipsForeignLoadPpmFileClass *class )
+{
+	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+	VipsObjectClass *object_class = (VipsObjectClass *) class;
+	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+
+	gobject_class->set_property = vips_object_set_property;
+	gobject_class->get_property = vips_object_get_property;
+
+	object_class->nickname = "ppmload_source";
+	object_class->build = vips_foreign_load_ppm_source_build;
+
+	load_class->is_a_source = vips_foreign_load_ppm_is_a_source;
+
+	VIPS_ARG_OBJECT( class, "source", 1,
+		_( "Source" ),
+		_( "Source to load from" ),
+		VIPS_ARGUMENT_REQUIRED_INPUT, 
+		G_STRUCT_OFFSET( VipsForeignLoadPpmSource, source ),
+		VIPS_TYPE_SOURCE );
+
+}
+
+static void
+vips_foreign_load_ppm_source_init( VipsForeignLoadPpmSource *source )
+{
+}
+
 #endif /*HAVE_PPM*/
 
 /**
@@ -752,3 +841,35 @@ vips_ppmload( const char *filename, VipsImage **out, ... )
 	return( result );
 }
 
+/**
+ * vips_ppmload_source:
+ * @source: source to load
+ * @out: (out): output image
+ * @...: %NULL-terminated list of optional named arguments
+ *
+ * Optional arguments:
+ *
+ * * @skip: skip this many lines at start of file
+ * * @lines: read this many lines from file
+ * * @whitespace: set of whitespace characters
+ * * @separator: set of separator characters
+ * * @fail: %gboolean, fail on errors
+ *
+ * Exactly as vips_ppmload(), but read from a source. 
+ *
+ * See also: vips_ppmload().
+ *
+ * Returns: 0 on success, -1 on error.
+ */
+int
+vips_ppmload_source( VipsSource *source, VipsImage **out, ... )
+{
+	va_list ap;
+	int result;
+
+	va_start( ap, out );
+	result = vips_call_split( "ppmload_source", ap, source, out ); 
+	va_end( ap );
+
+	return( result );
+}

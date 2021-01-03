@@ -449,6 +449,17 @@ vips_foreign_load_magick7_parse( VipsForeignLoadMagick7 *magick7,
 	out->Ysize = image->rows;
 	magick7->frame_height = image->rows;
 	out->Bands = magick7_get_bands( image ); 
+	if( out->Xsize <= 0 ||
+		out->Ysize <= 0 ||
+		out->Bands <= 0 ||
+		out->Xsize >= VIPS_MAX_COORD ||
+		out->Ysize >= VIPS_MAX_COORD ||
+		out->Bands >= VIPS_MAX_COORD ) {
+		vips_error( class->nickname, 
+			_( "bad image dimensions %d x %d pixels, %d bands" ),
+			out->Xsize, out->Ysize, out->Bands );
+		return( -1 );
+	}
 
 	/* Depth can be 'fractional'. You'd think we should use
 	 * GetImageDepth() but that seems to compute something very complex. 
@@ -751,15 +762,13 @@ G_DEFINE_TYPE( VipsForeignLoadMagick7File, vips_foreign_load_magick7_file,
 static gboolean
 ismagick7( const char *filename )
 {
-	/* Fetch the first 100 bytes. Hopefully that'll be enough.
+	/* Fetch up to the first 100 bytes. Hopefully that'll be enough.
 	 */
 	unsigned char buf[100];
+	int len;
 
-	/* Files shorter than 100 bytes will leave nonsense at the end of buf,
-	 * but it shouldn't matter.
-	 */
-	return( vips__get_bytes( filename, buf, 100 ) &&
-		magick_ismagick( buf, 100 ) );
+	return( (len = vips__get_bytes( filename, buf, 100 )) > 10 &&
+		magick_ismagick( buf, len ) );
 }
 
 static int
@@ -843,7 +852,7 @@ G_DEFINE_TYPE( VipsForeignLoadMagick7Buffer, vips_foreign_load_magick7_buffer,
 static gboolean
 vips_foreign_load_magick7_buffer_is_a_buffer( const void *buf, size_t len )
 {
-	return( magick_ismagick( (const unsigned char *) buf, len ) );
+	return( len > 10 && magick_ismagick( (const unsigned char *) buf, len ) );
 }
 
 static int

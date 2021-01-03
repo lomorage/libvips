@@ -6,6 +6,8 @@
  * 	- add "compression" option
  * 1/9/19 [meyermarcel]
  * 	- save alpha when necessary
+ * 15/3/20
+ * 	- revise for new VipsTarget API
  */
 
 /*
@@ -61,6 +63,10 @@
 typedef struct _VipsForeignSaveHeif {
 	VipsForeignSave parent_object;
 
+	/* Where to write (set by subclasses).
+	 */
+	VipsTarget *target;
+
 	/* Coding quality factor (1-100).
 	 */
 	int Q;
@@ -72,6 +78,10 @@ typedef struct _VipsForeignSaveHeif {
 	/* Compression format
 	 */
 	VipsForeignHeifCompression compression;
+
+	/* CPU effort (0-8).
+	 */
+	int speed;
 
 	/* The image we save. This is a copy of save->ready since we need to
 	 * be able to update the metadata.
@@ -112,6 +122,7 @@ vips_foreign_save_heif_dispose( GObject *gobject )
 {
 	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) gobject;
 
+	VIPS_UNREF( heif->target );
 	VIPS_UNREF( heif->image );
 	VIPS_FREEF( heif_image_release, heif->img );
 	VIPS_FREEF( heif_image_handle_release, heif->handle );
@@ -122,7 +133,6 @@ vips_foreign_save_heif_dispose( GObject *gobject )
 		dispose( gobject );
 }
 
-#ifdef HAVE_HEIF_CONTEXT_ADD_EXIF_METADATA
 typedef struct heif_error (*libheif_metadata_fn)( struct heif_context *,
 	 const struct heif_image_handle *,
 	 const void *, int );
@@ -134,15 +144,18 @@ struct _VipsForeignSaveHeifMetadata {
 	{ VIPS_META_EXIF_NAME, heif_context_add_exif_metadata },
 	{ VIPS_META_XMP_NAME, heif_context_add_XMP_metadata }
 };
-#endif /*HAVE_HEIF_CONTEXT_ADD_EXIF_METADATA*/
 
 static int
 vips_foreign_save_heif_write_metadata( VipsForeignSaveHeif *heif )
 {
-#ifdef HAVE_HEIF_CONTEXT_ADD_EXIF_METADATA
-
 	int i;
 	struct heif_error error;
+
+	/* Rebuild exif from tags, if we'll be saving it.
+	 */
+	if( vips_image_get_typeof( heif->image, VIPS_META_EXIF_NAME ) ) 
+		if( vips__exif_update( heif->image ) )
+			return( -1 );
 
 	for( i = 0; i < VIPS_NUMBER( libheif_metadata ); i++ )  
 		if( vips_image_get_typeof( heif->image, 
@@ -156,7 +169,7 @@ vips_foreign_save_heif_write_metadata( VipsForeignSaveHeif *heif )
 #endif /*DEBUG*/
 
 			if( vips_image_get_blob( heif->image, 
-				VIPS_META_EXIF_NAME, &data, &length ) )
+				libheif_metadata[i].name, &data, &length ) )
 				return( -1 );
 
 			error = libheif_metadata[i].saver( heif->ctx, 
@@ -166,7 +179,6 @@ vips_foreign_save_heif_write_metadata( VipsForeignSaveHeif *heif )
 				return( -1 );
 			}
 		}
-#endif /*HAVE_HEIF_CONTEXT_ADD_EXIF_METADATA*/
 
 	return( 0 );
 }
@@ -204,13 +216,9 @@ vips_foreign_save_heif_write_page( VipsForeignSaveHeif *heif, int page )
 	}
 #endif /*HAVE_HEIF_COLOR_PROFILE*/
 
-#ifdef HAVE_HEIF_ENCODING_OPTIONS_ALLOC
 	options = heif_encoding_options_alloc();
 	if( vips_image_hasalpha( heif->image ) )
 		options->save_alpha_channel = 1;
-#else /*!HAVE_HEIF_ENCODING_OPTIONS_ALLOC*/
-	options = NULL;
-#endif /*HAVE_HEIF_ENCODING_OPTIONS_ALLOC*/
 
 #ifdef DEBUG
 	printf( "encoding ..\n" ); 
@@ -218,16 +226,13 @@ vips_foreign_save_heif_write_page( VipsForeignSaveHeif *heif, int page )
 	error = heif_context_encode_image( heif->ctx, 
 		heif->img, heif->encoder, options, &heif->handle );
 
-#ifdef HAVE_HEIF_ENCODING_OPTIONS_ALLOC
 	heif_encoding_options_free( options );
-#endif /*HAVE_HEIF_ENCODING_OPTIONS_ALLOC*/
 
 	if( error.code ) {
 		vips__heif_error( &error );
 		return( -1 );
 	}
 
-#ifdef HAVE_HEIF_CONTEXT_SET_PRIMARY_IMAGE
 	if( vips_image_get_typeof( heif->image, "heif-primary" ) ) { 
 		int primary;
 
@@ -244,7 +249,6 @@ vips_foreign_save_heif_write_page( VipsForeignSaveHeif *heif, int page )
 			}
 		}
 	}
-#endif /*HAVE_HEIF_CONTEXT_SET_PRIMARY_IMAGE*/
 
 	if( !save->strip &&
 		vips_foreign_save_heif_write_metadata( heif ) )
@@ -292,6 +296,21 @@ vips_foreign_save_heif_write_block( VipsRegion *region, VipsRect *area,
 	return( 0 );
 }
 
+struct heif_error 
+vips_foreign_save_heif_write( struct heif_context *ctx, 
+	const void *data, size_t length, void *userdata )
+{
+	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) userdata;
+
+	struct heif_error error;
+
+	error.code = 0;
+	if( vips_target_write( heif->target, data, length ) )
+		error.code = -1;
+
+	return( error );
+}
+
 static int
 vips_foreign_save_heif_build( VipsObject *object )
 {
@@ -299,19 +318,17 @@ vips_foreign_save_heif_build( VipsObject *object )
 	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) object;
 
 	struct heif_error error;
+	struct heif_writer writer;
 
 	if( VIPS_OBJECT_CLASS( vips_foreign_save_heif_parent_class )->
 		build( object ) )
 		return( -1 );
 
-	/* Only rebuild exif if there's an EXIF block or we'll make a
-	 * default set of tags. EXIF is not required for heif.
+	/* Make a copy of the image in case we modify the metadata eg. for
+	 * exif_update.
 	 */
 	if( vips_copy( save->ready, &heif->image, NULL ) ) 
 		return( -1 );
-	if( vips_image_get_typeof( heif->image, VIPS_META_EXIF_NAME ) ) 
-		if( vips__exif_update( heif->image ) )
-			return( -1 );
 
 	error = heif_context_get_encoder_for_format( heif->ctx, 
 		(enum heif_compression_format) heif->compression, 
@@ -334,6 +351,14 @@ vips_foreign_save_heif_build( VipsObject *object )
 
 	error = heif_encoder_set_lossless( heif->encoder, heif->lossless );
 	if( error.code ) {
+		vips__heif_error( &error );
+		return( -1 );
+	}
+
+	error = heif_encoder_set_parameter_integer( heif->encoder,
+		"speed", heif->speed );
+	if( error.code &&
+		error.subcode != heif_suberror_Unsupported_parameter ) {
 		vips__heif_error( &error );
 		return( -1 );
 	}
@@ -376,6 +401,19 @@ vips_foreign_save_heif_build( VipsObject *object )
 	if( vips_sink_disc( heif->image, 
 		vips_foreign_save_heif_write_block, heif ) )
 		return( -1 );
+
+	/* This has to come right at the end :-( so there's no support for
+	 * incremental writes.
+	 */
+	writer.writer_api_version = 1;
+	writer.write = vips_foreign_save_heif_write;
+	error = heif_context_write( heif->ctx, &writer, heif );
+	if( error.code ) {
+		vips__heif_error( &error );
+		return( -1 );
+	}
+
+	vips_target_finish( heif->target );
 
 	return( 0 );
 }
@@ -432,6 +470,13 @@ vips_foreign_save_heif_class_init( VipsForeignSaveHeifClass *class )
 		VIPS_TYPE_FOREIGN_HEIF_COMPRESSION,
 		VIPS_FOREIGN_HEIF_COMPRESSION_HEVC );
 
+	VIPS_ARG_INT( class, "speed", 15,
+		_( "speed" ),
+		_( "CPU effort" ),
+		VIPS_ARGUMENT_OPTIONAL_INPUT,
+		G_STRUCT_OFFSET( VipsForeignSaveHeif, speed ),
+		0, 8, 5 );
+
 }
 
 static void
@@ -440,6 +485,7 @@ vips_foreign_save_heif_init( VipsForeignSaveHeif *heif )
 	heif->ctx = heif_context_alloc();
 	heif->Q = 50;
 	heif->compression = VIPS_FOREIGN_HEIF_COMPRESSION_HEVC;
+	heif->speed = 5;
 }
 
 typedef struct _VipsForeignSaveHeifFile {
@@ -462,20 +508,12 @@ vips_foreign_save_heif_file_build( VipsObject *object )
 	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) object;
 	VipsForeignSaveHeifFile *file = (VipsForeignSaveHeifFile *) object;
 
-	struct heif_error error;
+	if( !(heif->target = vips_target_new_to_file( file->filename )) )
+		return( -1 );
 
 	if( VIPS_OBJECT_CLASS( vips_foreign_save_heif_file_parent_class )->
 		build( object ) )
 		return( -1 );
-
-	/* This has to come right at the end :-( so there's no support for
-	 * incremental writes.
-	 */
-	error = heif_context_write_to_file( heif->ctx, file->filename );
-	if( error.code ) {
-		vips__heif_error( &error );
-		return( -1 );
-	}
 
 	return( 0 );
 }
@@ -520,55 +558,25 @@ typedef VipsForeignSaveHeifClass VipsForeignSaveHeifBufferClass;
 G_DEFINE_TYPE( VipsForeignSaveHeifBuffer, vips_foreign_save_heif_buffer, 
 	vips_foreign_save_heif_get_type() );
 
-struct heif_error 
-vips_foreign_save_heif_buffer_write( struct heif_context *ctx, 
-	const void *data, size_t length, void *userdata )
-{
-	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) userdata;
-
-	VipsBlob *blob;
-	struct heif_error error;
-	void *data_copy;
-
-	/* FIXME .. we have to memcpy()!
-	 */
-	data_copy = vips_malloc( NULL, length );
-	memcpy( data_copy, data, length );
-
-	blob = vips_blob_new( (VipsCallbackFn) vips_free, data_copy, length );
-	g_object_set( heif, "buffer", blob, NULL );
-	vips_area_unref( VIPS_AREA( blob ) );
-
-	error.code = 0;
-
-	return( error );
-}
-
 static int
 vips_foreign_save_heif_buffer_build( VipsObject *object )
 {
 	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) object;
+	VipsForeignSaveHeifBuffer *buffer = 
+		(VipsForeignSaveHeifBuffer *) object;
 
-	/* FIXME ... argh, allocating on the stack! But the example code does
-	 * this too.
-	 */
-	struct heif_writer writer;
-	struct heif_error error;
+	VipsBlob *blob;
+
+	if( !(heif->target = vips_target_new_to_memory()) )
+		return( -1 );
 
 	if( VIPS_OBJECT_CLASS( vips_foreign_save_heif_buffer_parent_class )->
 		build( object ) )
 		return( -1 );
 
-	/* This has to come right at the end :-( so there's no support for
-	 * incremental writes.
-	 */
-	writer.writer_api_version = 1;
-	writer.write = vips_foreign_save_heif_buffer_write;
-	error = heif_context_write( heif->ctx, &writer, heif );
-	if( error.code ) {
-		vips__heif_error( &error );
-		return( -1 );
-	}
+	g_object_get( heif->target, "blob", &blob, NULL );
+	g_object_set( buffer, "buffer", blob, NULL );
+	vips_area_unref( VIPS_AREA( blob ) );
 
 	return( 0 );
 }
@@ -600,6 +608,63 @@ vips_foreign_save_heif_buffer_init( VipsForeignSaveHeifBuffer *buffer )
 {
 }
 
+typedef struct _VipsForeignSaveHeifTarget {
+	VipsForeignSaveHeif parent_object;
+
+	VipsTarget *target;
+} VipsForeignSaveHeifTarget;
+
+typedef VipsForeignSaveHeifClass VipsForeignSaveHeifTargetClass;
+
+G_DEFINE_TYPE( VipsForeignSaveHeifTarget, vips_foreign_save_heif_target, 
+	vips_foreign_save_heif_get_type() );
+
+static int
+vips_foreign_save_heif_target_build( VipsObject *object )
+{
+	VipsForeignSaveHeif *heif = (VipsForeignSaveHeif *) object;
+	VipsForeignSaveHeifTarget *target = 
+		(VipsForeignSaveHeifTarget *) object;
+
+	if( target->target ) {
+		heif->target = target->target;
+		g_object_ref( heif->target );
+	}
+
+	if( VIPS_OBJECT_CLASS( vips_foreign_save_heif_target_parent_class )->
+		build( object ) )
+		return( -1 );
+
+	return( 0 );
+}
+
+static void
+vips_foreign_save_heif_target_class_init( 
+	VipsForeignSaveHeifTargetClass *class )
+{
+	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+	VipsObjectClass *object_class = (VipsObjectClass *) class;
+
+	gobject_class->set_property = vips_object_set_property;
+	gobject_class->get_property = vips_object_get_property;
+
+	object_class->nickname = "heifsave_target";
+	object_class->build = vips_foreign_save_heif_target_build;
+
+	VIPS_ARG_OBJECT( class, "target", 1,
+		_( "Target" ),
+		_( "Target to save to" ),
+		VIPS_ARGUMENT_REQUIRED_INPUT, 
+		G_STRUCT_OFFSET( VipsForeignSaveHeifTarget, target ),
+		VIPS_TYPE_TARGET );
+
+}
+
+static void
+vips_foreign_save_heif_target_init( VipsForeignSaveHeifTarget *target )
+{
+}
+
 #endif /*HAVE_HEIF_ENCODER*/
 
 /**
@@ -613,6 +678,7 @@ vips_foreign_save_heif_buffer_init( VipsForeignSaveHeifBuffer *buffer )
  * * @Q: %gint, quality factor
  * * @lossless: %gboolean, enable lossless encoding
  * * @compression: #VipsForeignHeifCompression, write with this compression
+ * * @speed: %gint, CPU effort, 0 slowest - 8 fastest, AV1 compression only
  *
  * Write a VIPS image to a file in HEIF format. 
  *
@@ -622,6 +688,9 @@ vips_foreign_save_heif_buffer_init( VipsForeignSaveHeifBuffer *buffer )
  * Set @lossless %TRUE to switch to lossless compression.
  *
  * Use @compression to set the encoder e.g. HEVC, AVC, AV1
+ *
+ * Use @speed to control the CPU effort spent improving compression.
+ * This is currently only applicable to AV1 encoders, defaults to 5.
  *
  * See also: vips_image_write_to_file(), vips_heifload().
  *
@@ -652,6 +721,7 @@ vips_heifsave( VipsImage *in, const char *filename, ... )
  * * @Q: %gint, quality factor
  * * @lossless: %gboolean, enable lossless encoding
  * * @compression: #VipsForeignHeifCompression, write with this compression
+ * * @speed: %gint, CPU effort, 0 slowest - 8 fastest, AV1 compression only
  *
  * As vips_heifsave(), but save to a memory buffer. 
  *
@@ -687,6 +757,38 @@ vips_heifsave_buffer( VipsImage *in, void **buf, size_t *len, ... )
 
 		vips_area_unref( area );
 	}
+
+	return( result );
+}
+
+/**
+ * vips_heifsave_target: (method)
+ * @in: image to save 
+ * @target: save image to this target
+ * @...: %NULL-terminated list of optional named arguments
+ *
+ * Optional arguments:
+ *
+ * * @Q: %gint, quality factor
+ * * @lossless: %gboolean, enable lossless encoding
+ * * @compression: #VipsForeignHeifCompression, write with this compression
+ * * @speed: %gint, CPU effort, 0 slowest - 8 fastest, AV1 compression only
+ *
+ * As vips_heifsave(), but save to a target.
+ *
+ * See also: vips_heifsave(), vips_image_write_to_target().
+ *
+ * Returns: 0 on success, -1 on error.
+ */
+int
+vips_heifsave_target( VipsImage *in, VipsTarget *target, ... )
+{
+	va_list ap;
+	int result;
+
+	va_start( ap, target );
+	result = vips_call_split( "heifsave_target", ap, in, target );
+	va_end( ap );
 
 	return( result );
 }

@@ -77,6 +77,8 @@
  * 	- restart after minimise
  * 14/10/19
  * 	- revise for connection IO
+ * 11/5/20
+ * 	- only warn for saving bad profiles, don't fail
  */
 
 /*
@@ -276,16 +278,18 @@ read_new( VipsSource *source, VipsImage *out, gboolean fail )
 		user_error_function, user_warning_function )) ) 
 		return( NULL );
 
-#ifdef PNG_SKIP_sRGB_CHECK_PROFILE
-	/* Prevent libpng (>=1.6.11) verifying sRGB profiles.
+	/* Prevent libpng (>=1.6.11) verifying sRGB profiles. Many PNGs have
+	 * broken profiles, but we still want to be able to open them.
 	 */
+#ifdef PNG_SKIP_sRGB_CHECK_PROFILE
 	png_set_option( read->pPng, 
 		PNG_SKIP_sRGB_CHECK_PROFILE, PNG_OPTION_ON );
 #endif /*PNG_SKIP_sRGB_CHECK_PROFILE*/
 
-#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-	/* Disable CRC checking in fuzzing mode.
+	/* Disable CRC checking in fuzzing mode. Most fuzzed images will have
+	 * bad CRCs so this check would break fuzzing.
 	 */
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 	png_set_crc_action( read->pPng,
 		PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE );
 #endif /*FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION*/
@@ -351,7 +355,7 @@ static int
 png2vips_header( Read *read, VipsImage *out )
 {
 	png_uint_32 width, height;
-	int bit_depth, color_type;
+	int bitdepth, color_type;
 	int interlace_type;
 
 	png_uint_32 res_x, res_y;
@@ -381,7 +385,7 @@ png2vips_header( Read *read, VipsImage *out )
 		return( -1 );
 
 	png_get_IHDR( read->pPng, read->pInfo, 
-		&width, &height, &bit_depth, &color_type,
+		&width, &height, &bitdepth, &color_type,
 		&interlace_type, NULL, NULL );
 
 	/* png_get_channels() gives us 1 band for palette images ... so look
@@ -409,7 +413,7 @@ png2vips_header( Read *read, VipsImage *out )
 		return( -1 );
 	}
 
-	if( bit_depth > 8 ) {
+	if( bitdepth > 8 ) {
 		if( bands < 3 )
 			interpretation = VIPS_INTERPRETATION_GREY16;
 		else
@@ -444,21 +448,21 @@ png2vips_header( Read *read, VipsImage *out )
 	/* Expand <8 bit images to full bytes.
 	 */
 	if( color_type == PNG_COLOR_TYPE_GRAY &&
-		bit_depth < 8 ) 
+		bitdepth < 8 ) 
 		png_set_expand_gray_1_2_4_to_8( read->pPng );
 
 	/* If we're an INTEL byte order machine and this is 16bits, we need
 	 * to swap bytes.
 	 */
-	if( bit_depth > 8 && 
+	if( bitdepth > 8 && 
 		!vips_amiMSBfirst() )
 		png_set_swap( read->pPng );
 
 	/* Get resolution. Default to 72 pixels per inch, the usual png value. 
 	 */
 	unit_type = PNG_RESOLUTION_METER;
-	res_x = (72 / 2.54 * 100);
-	res_y = (72 / 2.54 * 100);
+	res_x = 72.0 / 2.54 * 100.0;
+	res_y = 72.0 / 2.54 * 100.0;
 	png_get_pHYs( read->pPng, read->pInfo, &res_x, &res_y, &unit_type );
 	switch( unit_type ) {
 	case PNG_RESOLUTION_METER:
@@ -476,8 +480,7 @@ png2vips_header( Read *read, VipsImage *out )
 	 */
 	vips_image_init_fields( out,
 		width, height, bands,
-		bit_depth > 8 ? 
-			VIPS_FORMAT_USHORT : VIPS_FORMAT_UCHAR,
+		bitdepth > 8 ? VIPS_FORMAT_USHORT : VIPS_FORMAT_UCHAR,
 		VIPS_CODING_NONE, interpretation, 
 		Xres, Yres );
 
@@ -552,7 +555,7 @@ png2vips_header( Read *read, VipsImage *out )
 	/* Attach original palette bit depth, if any, as metadata.
 	 */
 	if( color_type == PNG_COLOR_TYPE_PALETTE )
-		vips_image_set_int( out, "palette-bit-depth", bit_depth );
+		vips_image_set_int( out, "palette-bit-depth", bitdepth );
 
 	return( 0 );
 }
@@ -711,8 +714,11 @@ vips__png_header_source( VipsSource *source, VipsImage *out )
 	Read *read;
 
 	if( !(read = read_new( source, out, TRUE )) ||
-		png2vips_header( read, out ) )
+		png2vips_header( read, out ) ) {
+		vips_error( "png2vips", _( "unable to read source %s" ),
+			vips_connection_nick( VIPS_CONNECTION( source ) ) );
 		return( -1 );
+	}
 
 	vips_source_minimise( source );
 
@@ -726,8 +732,11 @@ vips__png_read_source( VipsSource *source, VipsImage *out, gboolean fail )
 
 	if( !(read = read_new( source, out, fail )) ||
 		png2vips_image( read, out ) ||
-		vips_source_decode( source ) )
+		vips_source_decode( source ) ) {
+		vips_error( "png2vips", _( "unable to read source %s" ),
+			vips_connection_nick( VIPS_CONNECTION( source ) ) );
 		return( -1 );
+	}
 
 	return( 0 );
 }
@@ -813,9 +822,11 @@ write_new( VipsImage *in, VipsTarget *target )
 		return( NULL );
 	}
 
-#ifdef PNG_SKIP_sRGB_CHECK_PROFILE
-	/* Prevent libpng (>=1.6.11) verifying sRGB profiles.
+	/* Prevent libpng (>=1.6.11) verifying sRGB profiles. We are often
+	 * asked to copy images containing bad profiles, and this check would
+	 * prevent that.
 	 */
+#ifdef PNG_SKIP_sRGB_CHECK_PROFILE
 	png_set_option( write->pPng, 
 		PNG_SKIP_sRGB_CHECK_PROFILE, PNG_OPTION_ON );
 #endif /*PNG_SKIP_sRGB_CHECK_PROFILE*/
@@ -918,11 +929,11 @@ static int
 write_vips( Write *write, 
 	int compress, int interlace, const char *profile,
 	VipsForeignPngFilter filter, gboolean strip,
-	gboolean palette, int colours, int Q, double dither )
+	gboolean palette, int Q, double dither,
+	int bitdepth )
 {
 	VipsImage *in = write->in;
 
-	int bit_depth;
 	int color_type;
 	int interlace_type;
 	int i, nb_passes;
@@ -964,8 +975,6 @@ write_vips( Write *write,
 	 */
 	png_set_filter( write->pPng, 0, filter );
 
-	bit_depth = in->BandFmt == VIPS_FORMAT_UCHAR ? 8 : 16;
-
 	switch( in->Bands ) {
 	case 1: color_type = PNG_COLOR_TYPE_GRAY; break;
 	case 2: color_type = PNG_COLOR_TYPE_GRAY_ALPHA; break;
@@ -981,12 +990,8 @@ write_vips( Write *write,
 #ifdef HAVE_IMAGEQUANT
 	/* Enable image quantisation to paletted 8bpp PNG if colours is set.
 	 */
-	if( palette ) {
-		g_assert( colours >= 2 && 
-			colours <= 256 );
-		bit_depth = 8;
+	if( palette ) 
 		color_type = PNG_COLOR_TYPE_PALETTE;
-	}
 #else
 	if( palette )
 		g_warning( "%s",
@@ -996,7 +1001,7 @@ write_vips( Write *write,
 	interlace_type = interlace ? PNG_INTERLACE_ADAM7 : PNG_INTERLACE_NONE;
 
 	png_set_IHDR( write->pPng, write->pInfo, 
-		in->Xsize, in->Ysize, bit_depth, color_type, interlace_type, 
+		in->Xsize, in->Ysize, bitdepth, color_type, interlace_type, 
 		PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT );
 
 	/* Set resolution. libpng uses pixels per meter.
@@ -1043,10 +1048,28 @@ write_vips( Write *write,
 				"of ICC profile\n", length );
 #endif /*DEBUG*/
 
-			png_set_iCCP( write->pPng, write->pInfo, "icc",
-				PNG_COMPRESSION_TYPE_BASE, 
-				(void *) data, length );
+			/* We need to ignore any errors from png_set_iCCP()
+			 * since we want to drop incompatible profiles rather
+			 * than simply failing.
+			 */
+			if( setjmp( png_jmpbuf( write->pPng ) ) ) {
+				/* Silent ignore of error.
+				 */
+				g_warning( "bad ICC profile not saved" );
+			}
+			else {
+				/* This will jump back to the line above on
+				 * error.
+				 */
+				png_set_iCCP( write->pPng, write->pInfo, "icc",
+					PNG_COMPRESSION_TYPE_BASE, 
+					(void *) data, length );
+			}
 
+			/* And restore the setjmp.
+			 */
+			if( setjmp( png_jmpbuf( write->pPng ) ) ) 
+				return( -1 );
 		}
 
 		if( vips_image_get_typeof( in, VIPS_META_XMP_NAME ) ) {
@@ -1083,7 +1106,7 @@ write_vips( Write *write,
 		int trans_count;
 
 		if( vips__quantise_image( in, &im_index, &im_palette, 
-			colours, Q, dither ) ) 
+			1 << bitdepth, Q, dither ) ) 
 			return( -1 );
 
 		palette_count = im_palette->Xsize;
@@ -1143,9 +1166,13 @@ write_vips( Write *write,
 	/* If we're an intel byte order CPU and this is a 16bit image, we need
 	 * to swap bytes.
 	 */
-	if( bit_depth > 8 && 
+	if( bitdepth > 8 && 
 		!vips_amiMSBfirst() ) 
 		png_set_swap( write->pPng ); 
+
+	/* If bitdepth is 1/2/4, pack pixels into bytes.
+	 */
+	png_set_packing( write->pPng );
 
 	if( interlace )	
 		nb_passes = png_set_interlace_handling( write->pPng );
@@ -1165,6 +1192,8 @@ write_vips( Write *write,
 
 	png_write_end( write->pPng, write->pInfo );
 
+	vips_target_finish( write->target );
+
 	return( 0 );
 }
 
@@ -1172,7 +1201,8 @@ int
 vips__png_write_target( VipsImage *in, VipsTarget *target,
 	int compression, int interlace,
 	const char *profile, VipsForeignPngFilter filter, gboolean strip,
-	gboolean palette, int colours, int Q, double dither )
+	gboolean palette, int Q, double dither,
+	int bitdepth )
 {
 	Write *write;
 
@@ -1181,10 +1211,10 @@ vips__png_write_target( VipsImage *in, VipsTarget *target,
 
 	if( write_vips( write, 
 		compression, interlace, profile, filter, strip, palette,
-		colours, Q, dither ) ) {
+		Q, dither, bitdepth ) ) {
 		write_finish( write );
-		vips_error( "vips2png", 
-			"%s", _( "unable to write to target" ) );
+		vips_error( "vips2png", _( "unable to write to target %s" ),
+			vips_connection_nick( VIPS_CONNECTION( target ) ) );
 		return( -1 );
 	}
 

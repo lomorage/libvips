@@ -2,7 +2,7 @@
 import pytest
 
 import pyvips
-from helpers import JPEG_FILE, HEIC_FILE, all_formats, have
+from helpers import JPEG_FILE, OME_FILE, HEIC_FILE, TIF_FILE, all_formats, have
 
 
 # Run a function expecting a complex image on a two-band image
@@ -166,13 +166,37 @@ class TestResample:
         im2 = pyvips.Image.thumbnail_buffer(buf, 100)
         assert abs(im1.avg() - im2.avg()) < 1
 
+        # should be able to thumbnail many-page tiff
+        im = pyvips.Image.thumbnail(OME_FILE, 100)
+        assert im.width == 100
+        assert im.height == 38
+
+        # should be able to thumbnail individual pages from many-page tiff
+        im1 = pyvips.Image.thumbnail(OME_FILE + "[page=0]", 100)
+        assert im1.width == 100
+        assert im1.height == 38
+        im2 = pyvips.Image.thumbnail(OME_FILE + "[page=1]", 100)
+        assert im2.width == 100
+        assert im2.height == 38
+        assert (im1 - im2).abs().max() != 0 
+
+        # should be able to thumbnail entire many-page tiff as a toilet-roll
+        # image
+        im = pyvips.Image.thumbnail(OME_FILE + "[n=-1]", 100)
+        assert im.width == 100
+        assert im.height == 570
+
+        # should be able to thumbnail a single-page tiff in a buffer
+        im1 = pyvips.Image.thumbnail(TIF_FILE, 100)
+        with open(TIF_FILE, 'rb') as f:
+            buf = f.read()
+        im2 = pyvips.Image.thumbnail_buffer(buf, 100)
+        assert abs(im1.avg() - im2.avg()) < 1
+
         if have("heifload"):
             # this image is orientation 6 ... thumbnail should flip it
             im = pyvips.Image.new_from_file(HEIC_FILE)
             thumb = pyvips.Image.thumbnail(HEIC_FILE, 100)
-
-            # original is landscape
-            assert im.width > im.height
 
             # thumb should be portrait 
             assert thumb.width < thumb.height

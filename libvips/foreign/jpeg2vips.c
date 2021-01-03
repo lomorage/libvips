@@ -106,6 +106,10 @@
  * 	- restart after minimise
  * 14/10/19
  * 	- revise for source IO
+ * 5/5/20 angelmixu
+ * 	- better handling of JFIF res unit 0
+ * 13/9/20
+ * 	- set resolution unit from JFIF 
  */
 
 /*
@@ -332,7 +336,7 @@ readjpeg_free( ReadJpeg *jpeg )
 }
 
 static void
-readjpeg_close_cb( VipsObject *object, ReadJpeg *jpeg )
+readjpeg_close_cb( VipsImage *image, ReadJpeg *jpeg )
 {
 	(void) readjpeg_free( jpeg );
 }
@@ -504,24 +508,29 @@ read_jpeg_header( ReadJpeg *jpeg, VipsImage *out )
 		break;
 	}
 
-	/* Get the jfif resolution. exif may overwrite this later.
+#ifdef DEBUG
+	if( cinfo->saw_JFIF_marker )
+		printf( "read_jpeg_header: jfif _density %d, %d, unit %d\n",
+			cinfo->X_density, cinfo->Y_density,
+			cinfo->density_unit );
+#endif /*DEBUG*/
+
+	/* Get the jfif resolution. exif may overwrite this later. Default to
+	 * 72dpi (as EXIF does).
 	 */
-	xres = 1.0;
-	yres = 1.0;
+	xres = 72.0 / 25.4;
+	yres = 72.0 / 25.4;
 	if( cinfo->saw_JFIF_marker &&
 		cinfo->X_density != 1U && 
 		cinfo->Y_density != 1U ) {
-#ifdef DEBUG
-		printf( "read_jpeg_header: seen jfif _density %d, %d\n",
-			cinfo->X_density, cinfo->Y_density );
-#endif /*DEBUG*/
-
 		switch( cinfo->density_unit ) {
 		case 0:
-			/* None. Just set.
+			/* X_density / Y_density gives the pixel aspect ratio.
+			 * Leave xres, but adjust yres.
 			 */
-			xres = cinfo->X_density;
-			yres = cinfo->Y_density;
+			if( cinfo->Y_density > 0 )
+				yres = xres * cinfo->X_density / 
+					cinfo->Y_density;
 			break;
 
 		case 1:
@@ -529,6 +538,8 @@ read_jpeg_header( ReadJpeg *jpeg, VipsImage *out )
 			 */
 			xres = cinfo->X_density / 25.4;
 			yres = cinfo->Y_density / 25.4;
+			vips_image_set_string( out, 
+				VIPS_META_RESOLUTION_UNIT, "in" );
 			break;
 
 		case 2:
@@ -536,6 +547,8 @@ read_jpeg_header( ReadJpeg *jpeg, VipsImage *out )
 			 */
 			xres = cinfo->X_density / 10.0;
 			yres = cinfo->Y_density / 10.0;
+			vips_image_set_string( out, 
+				VIPS_META_RESOLUTION_UNIT, "cm" );
 			break;
 
 		default:
@@ -722,7 +735,7 @@ read_jpeg_header( ReadJpeg *jpeg, VipsImage *out )
 		}
 
 		vips_image_set_blob( out, VIPS_META_ICC_NAME, 
-			(VipsCallbackFn) vips_free, data, data_length );
+			(VipsCallbackFn) vips_area_free_cb, data, data_length );
 	}
 
 	return( 0 );
@@ -824,40 +837,6 @@ read_jpeg_generate( VipsRegion *or,
 	return( 0 );
 }
 
-/* Auto-rotate, if rotate_image is set.
- */
-static VipsImage *
-read_jpeg_rotate( VipsObject *process, VipsImage *im )
-{
-	VipsImage **t = (VipsImage **) vips_object_local_array( process, 3 );
-	VipsAngle angle = vips_autorot_get_angle( im );
-
-	if( angle != VIPS_ANGLE_D0 ) {
-		/* Need to copy to memory or disc, we have to stay seq.
-		 */
-		const guint64 image_size = VIPS_IMAGE_SIZEOF_IMAGE( im );
-		const guint64 disc_threshold = vips_get_disc_threshold();
-
-		if( image_size > disc_threshold ) 
-			t[0] = vips_image_new_temp_file( "%s.v" );
-		else
-			t[0] = vips_image_new_memory();
-
-		if( vips_image_write( im, t[0] ) ||
-			vips_rot( t[0], &t[1], angle, NULL ) )
-			return( NULL );
-		im = t[1];
-
-		if( vips_copy( im, &t[2], NULL ) )
-			return( NULL );
-		im = t[2];
-
-		vips_autorot_remove_angle( im ); 
-	}
-
-	return( im );
-}
-
 /* Read a cinfo to a VIPS image.
  */
 static int
@@ -865,7 +844,7 @@ read_jpeg_image( ReadJpeg *jpeg, VipsImage *out )
 {
 	struct jpeg_decompress_struct *cinfo = &jpeg->cinfo;
 	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( out ), 3 );
+		vips_object_local_array( VIPS_OBJECT( out ), 5 );
 
 	VipsImage *im;
 
@@ -896,10 +875,18 @@ read_jpeg_image( ReadJpeg *jpeg, VipsImage *out )
 		vips_extract_area( t[1], &t[2], 
 			0, 0, jpeg->output_width, jpeg->output_height, NULL ) )
 		return( -1 );
-
 	im = t[2];
-	if( jpeg->autorotate )
-		im = read_jpeg_rotate( VIPS_OBJECT( out ), im );
+
+	if( jpeg->autorotate &&
+		vips_image_get_orientation( im ) != 1 ) {
+		/* We have to copy to memory before calling autorot, since it
+		 * needs random access.
+		 */
+		if( !(t[3] = vips_image_copy_memory( im )) ||
+			vips_autorot( t[3], &t[4], NULL ) )
+			return( -1 );
+		im = t[4];
+	}
 
 	if( vips_image_write( im, out ) )
 		return( -1 );
@@ -942,15 +929,9 @@ vips__jpeg_read( ReadJpeg *jpeg, VipsImage *out, gboolean header_only )
 
 		/* Swap width and height if we're going to rotate this image.
 		 */
-		if( jpeg->autorotate ) { 
-			VipsAngle angle = vips_autorot_get_angle( out ); 
-
-			if( angle == VIPS_ANGLE_D90 || 
-				angle == VIPS_ANGLE_D270 )
-				VIPS_SWAP( int, out->Xsize, out->Ysize );
-
-			/* We won't be returning an orientation tag.
-			 */
+		if( jpeg->autorotate &&
+			vips_image_get_orientation_swap( out ) ) {
+			VIPS_SWAP( int, out->Xsize, out->Ysize );
 			vips_autorot_remove_angle( out ); 
 		}
 	}

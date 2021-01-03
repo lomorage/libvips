@@ -49,11 +49,11 @@ void vips__tiff_init( void );
 
 int vips__tiff_write( VipsImage *in, const char *filename, 
 	VipsForeignTiffCompression compression, int Q, 
-		VipsForeignTiffPredictor predictor,
-	char *profile,
+	VipsForeignTiffPredictor predictor,
+	const char *profile,
 	gboolean tile, int tile_width, int tile_height,
 	gboolean pyramid,
-	gboolean squash,
+	int bitdepth,
 	gboolean miniswhite,
 	VipsForeignTiffResunit resunit, double xres, double yres,
 	gboolean bigtiff,
@@ -61,30 +61,36 @@ int vips__tiff_write( VipsImage *in, const char *filename,
 	gboolean properties,
 	gboolean strip,
 	VipsRegionShrink region_shrink,
-	int level, gboolean lossless );
+	int level, 
+	gboolean lossless,
+	VipsForeignDzDepth depth,
+	gboolean subifd );
 
 int vips__tiff_write_buf( VipsImage *in, 
 	void **obuf, size_t *olen, 
 	VipsForeignTiffCompression compression, int Q, 
 	VipsForeignTiffPredictor predictor,
-	char *profile,
+	const char *profile,
 	gboolean tile, int tile_width, int tile_height,
 	gboolean pyramid,
-	gboolean squash,
+	int bitdepth,
 	gboolean miniswhite,
 	VipsForeignTiffResunit resunit, double xres, double yres,
 	gboolean bigtiff,
 	gboolean rgbjpeg,
 	gboolean properties, gboolean strip,
 	VipsRegionShrink region_shrink,
-	int level, gboolean lossless );
+	int level, 
+	gboolean lossless,
+	VipsForeignDzDepth depth,
+	gboolean subifd );
 
 gboolean vips__istiff_source( VipsSource *source );
 gboolean vips__istifftiled_source( VipsSource *source );
 int vips__tiff_read_header_source( VipsSource *source, VipsImage *out, 
-	int page, int n, gboolean autorotate );
+	int page, int n, gboolean autorotate, int subifd );
 int vips__tiff_read_source( VipsSource *source, VipsImage *out,
-	int page, int n, gboolean autorotate );
+	int page, int n, gboolean autorotate, int subifd );
 
 extern const char *vips__foreign_tiff_suffs[];
 
@@ -160,9 +166,9 @@ extern const char *vips__jpeg_suffs[];
 int vips__jpeg_write_target( VipsImage *in, VipsTarget *target,
 	int Q, const char *profile, 
 	gboolean optimize_coding, gboolean progressive, gboolean strip,
-	gboolean no_subsample, gboolean trellis_quant,
-	gboolean overshoot_deringing, gboolean optimize_scans, 
-	int quant_table );
+	gboolean trellis_quant, gboolean overshoot_deringing,
+	gboolean optimize_scans, int quant_table,
+	VipsForeignJpegSubsample subsample_mode );
 
 int vips__jpeg_read_source( VipsSource *source, VipsImage *out,
 	gboolean header_only, int shrink, int fail, gboolean autorotate );
@@ -178,7 +184,8 @@ extern const char *vips__png_suffs[];
 int vips__png_write_target( VipsImage *in, VipsTarget *target,
 	int compress, int interlace, const char *profile,
 	VipsForeignPngFilter filter, gboolean strip,
-	gboolean palette, int colours, int Q, double dither );
+	gboolean palette, int Q, double dither,
+	int bitdepth );
 
 /* Map WEBP metadata names to vips names.
  */
@@ -204,7 +211,7 @@ int vips__webp_write_target( VipsImage *image, VipsTarget *target,
 	gboolean smart_subsample, gboolean near_lossless,
 	int alpha_q, int reduction_effort,
 	gboolean min_size, int kmin, int kmax,
-	gboolean strip );
+	gboolean strip, const char *profile );
 
 int vips__openslide_isslide( const char *filename );
 int vips__openslide_read_header( const char *filename, VipsImage *out, 

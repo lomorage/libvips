@@ -98,7 +98,10 @@
 #include <vips/thread.h>
 #include <vips/internal.h>
 #include <vips/vector.h>
+
+#if ENABLE_DEPRECATED
 #include <vips/vips7compat.h>
+#endif
 
 /* abort() on the first warning or error.
  */
@@ -126,6 +129,8 @@ int vips__leak = 0;
  */
 GQuark vips__image_pixels_quark = 0; 
 #endif /*DEBUG_LEAK*/
+
+static gint64 vips_pipe_read_limit = 1024 * 1024 * 1024;
 
 /**
  * vips_get_argv0:
@@ -279,6 +284,24 @@ empty_log_handler( const gchar *log_domain, GLogLevelFlags log_level,
 {       
 }
 
+#if !GLIB_CHECK_VERSION( 2, 31, 0 )
+static void
+default_log_handler( const gchar *log_domain, GLogLevelFlags log_level,
+	const gchar *message, gpointer user_data )
+{
+	if( log_level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_INFO) ) {
+		const char *domains = g_getenv( "G_MESSAGES_DEBUG" );
+
+		if( !domains || 
+			(!g_str_equal( domains, "all" ) &&
+			 !g_strrstr( domains, log_domain )) ) 
+	  		return;
+	}
+
+	g_log_default_handler( log_domain, log_level, message, user_data );
+}
+#endif /*!GLIB_CHECK_VERSION( 2, 31, 0 )*/
+
 /* Attempt to set a minimum stacksize. This can be important on systems with a
  * very low default, like musl.
  */
@@ -310,6 +333,26 @@ set_stacksize( guint64 size )
 #endif /*HAVE_PTHREAD_DEFAULT_NP*/
 }
 
+static void
+vips_verbose( void ) 
+{
+	const char *old;
+
+	old = g_getenv( "G_MESSAGES_DEBUG" );
+
+	if( !old ) 
+		g_setenv( "G_MESSAGES_DEBUG", G_LOG_DOMAIN, TRUE );
+	else if( !g_str_equal( old, "all" ) &&
+		!g_strrstr( old, G_LOG_DOMAIN ) ) {
+		char *new;
+
+		new = g_strconcat( old, " ", G_LOG_DOMAIN, NULL );
+		g_setenv( "G_MESSAGES_DEBUG", new, TRUE );
+
+		g_free( new );
+	}
+}
+
 /**
  * vips_init:
  * @argv0: name of application
@@ -334,6 +377,7 @@ vips_init( const char *argv0 )
 	extern GType vips_source_custom_get_type( void ); 
 	extern GType vips_target_get_type( void ); 
 	extern GType vips_target_custom_get_type( void ); 
+	extern GType vips_g_input_stream_get_type( void ); 
 
 	static gboolean started = FALSE;
 	static gboolean done = FALSE;
@@ -388,7 +432,9 @@ vips_init( const char *argv0 )
 	 * we have to make sure we do this single-threaded. See: 
 	 * https://github.com/openslide/openslide/issues/161
 	 */
+#if !GLIB_CHECK_VERSION( 2, 48, 1 )
 	(void) g_get_language_names(); 
+#endif
 
 	if( !vips__global_lock )
 		vips__global_lock = vips_g_mutex_new();
@@ -428,19 +474,24 @@ vips_init( const char *argv0 )
 	g_free( locale );
 	bind_textdomain_codeset( GETTEXT_PACKAGE, "UTF-8" );
 
-	/* Deprecated, this is just for compat.
-	 */
+#if ENABLE_DEPRECATED
 	if( g_getenv( "VIPS_INFO" ) || 
 		g_getenv( "IM_INFO" ) ) 
-		vips_info_set( TRUE );
-
+#else
+	if( g_getenv( "VIPS_INFO" ) ) 
+#endif
+		vips_verbose();
 	if( g_getenv( "VIPS_PROFILE" ) )
 		vips_profile_set( TRUE );
-
-	/* Default various settings from env.
-	 */
+	if( g_getenv( "VIPS_LEAK" ) )
+		vips_leak_set( TRUE );
 	if( g_getenv( "VIPS_TRACE" ) )
 		vips_cache_set_trace( TRUE );
+	if( g_getenv( "VIPS_PIPE_READ_LIMIT" ) ) 
+		vips_pipe_read_limit = 
+			g_ascii_strtoll( g_getenv( "VIPS_PIPE_READ_LIMIT" ),
+				NULL, 10 );
+	vips_pipe_read_limit_set( vips_pipe_read_limit );
 
 	/* Register base vips types.
 	 */
@@ -455,7 +506,10 @@ vips_init( const char *argv0 )
 	(void) vips_target_custom_get_type(); 
 	vips__meta_init_types();
 	vips__interpolate_init();
+
+#if ENABLE_DEPRECATED
 	im__format_init();
+#endif
 
 	/* Start up operator cache.
 	 */
@@ -480,6 +534,7 @@ vips_init( const char *argv0 )
 	vips_morphology_operation_init();
 	vips_draw_operation_init();
 	vips_mosaicing_operation_init();
+	vips_g_input_stream_get_type(); 
 
 	/* Load any vips8 plugins from the vips libdir. Keep going, even if
 	 * some plugins fail to load. 
@@ -487,6 +542,7 @@ vips_init( const char *argv0 )
 	(void) vips_load_plugins( "%s/vips-plugins-%d.%d", 
 		libdir, VIPS_MAJOR_VERSION, VIPS_MINOR_VERSION );
 
+#if ENABLE_DEPRECATED
 	/* Load up any vips7 plugins in the vips libdir. We don't error on 
 	 * failure, it's too annoying to have VIPS refuse to start because of 
 	 * a broken plugin.
@@ -504,6 +560,7 @@ vips_init( const char *argv0 )
 		g_warning( "%s", vips_error_buffer() );
 		vips_error_clear();
 	}
+#endif
 
 	/* Get the run-time compiler going.
 	 */
@@ -536,10 +593,26 @@ vips_init( const char *argv0 )
 	 * set up if you are using libvips from something like Ruby. Allow this
 	 * env var hack as a workaround. 
 	 */
+#if ENABLE_DEPRECATED
 	if( g_getenv( "VIPS_WARNING" ) ||
 		g_getenv( "IM_WARNING" ) ) 
-		g_log_set_handler( "VIPS", G_LOG_LEVEL_WARNING, 
+#else
+	if( g_getenv( "VIPS_WARNING" ) )
+#endif
+		g_log_set_handler( G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, 
 			empty_log_handler, NULL );
+
+#if !GLIB_CHECK_VERSION( 2, 31, 0 )
+	/* Older glibs can sometimes show G_LOG_LEVEL_{INFO,DEBUG} messages.
+	 * Block them ourselves. We test the env var inside the handler since
+	 * vips_verbose() can be toggled at runtime.
+	 *
+	 * Again, we should not call g_log_set_handler(), but this is the only
+	 * convenient way to fix this behaviour.
+	 */
+	g_log_set_handler( G_LOG_DOMAIN, G_LOG_LEVEL_INFO | G_LOG_LEVEL_DEBUG, 
+		default_log_handler, NULL );
+#endif /*!GLIB_CHECK_VERSION( 2, 31, 0 )*/
 
 	/* Set a minimum stacksize, if we can.
 	 */
@@ -589,7 +662,7 @@ vips_leak( void )
 		vips_buf_appendf( &buf, "error buffer: %s", 
 			vips_error_buffer() );
 
-	if( vips__n_active_threads != 0 )
+	if( vips__n_active_threads > 0 )
 		vips_buf_appendf( &buf, "threads: %d not joined\n", 
 			vips__n_active_threads ); 
 
@@ -643,7 +716,9 @@ vips_shutdown( void )
 
 	vips_cache_drop_all();
 
+#if ENABLE_DEPRECATED
 	im_close_plugins();
+#endif
 
 	/* Mustn't run this more than once. Don't use the VIPS_GATE macro,
 	 * since we don't for gate start.
@@ -701,7 +776,7 @@ static gboolean
 vips_lib_info_cb( const gchar *option_name, const gchar *value, 
 	gpointer data, GError **error )
 {
-	vips_info_set( TRUE ); 
+	vips_verbose();
 
 	return( TRUE );
 }
@@ -729,6 +804,24 @@ vips_lib_version_cb( const gchar *option_name, const gchar *value,
 	gpointer data, GError **error )
 {
 	printf( "libvips %s\n", VIPS_VERSION_STRING );
+	vips_shutdown();
+	exit( 0 );
+}
+
+static gboolean
+vips_lib_config_cb( const gchar *option_name, const gchar *value, 
+	gpointer data, GError **error )
+{
+	char **split;
+	char *config;
+
+	split = g_strsplit( VIPS_CONFIG, ", ", -1 );
+	config = g_strjoinv( "\n", split );
+
+	printf( "%s\n", config );
+	g_strfreev( split );
+	g_free( config );
+
 	vips_shutdown();
 	exit( 0 );
 }
@@ -815,6 +908,12 @@ static GOptionEntry option_entries[] = {
 	{ "vips-version", 0, G_OPTION_FLAG_NO_ARG, 
 		G_OPTION_ARG_CALLBACK, (gpointer) &vips_lib_version_cb, 
 		N_( "print libvips version" ), NULL },
+	{ "vips-config", 0, G_OPTION_FLAG_NO_ARG, 
+		G_OPTION_ARG_CALLBACK, (gpointer) &vips_lib_config_cb, 
+		N_( "print libvips config" ), NULL },
+	{ "vips-pipe-read-limit", 0, 0, 
+		G_OPTION_ARG_INT64, (gpointer) &vips_pipe_read_limit, 
+		N_( "read at most this many bytes from a pipe" ), NULL },
 	{ NULL }
 };
 
@@ -1193,8 +1292,8 @@ vips_version( int flag )
  * vips_leak_set:
  * @leak: turn leak checking on or off
  *
- * Turn on or off vips leak checking. See also --vips-leak and
- * vips_add_option_entries(). 
+ * Turn on or off vips leak checking. See also --vips-leak,
+ * vips_add_option_entries() and the `VIPS_LEAK` environment variable.
  *
  * You should call this very early in your program. 
  */

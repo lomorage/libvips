@@ -1,7 +1,15 @@
 /* A byte source/sink .. it can be a pipe, file descriptor, memory area, 
  * socket, node.js stream, etc.
  * 
- * J.Cupitt, 19/6/14
+ * 19/6/14
+ *
+ * 3/2/20
+ * 	- add vips_pipe_read_limit_set()
+ * 3/10/20
+ * 	- improve behaviour with read and seek on pipes
+ * 26/11/20
+ * 	- use _setmode() on win to force binary read for previously opened
+ * 	  descriptors
  */
 
 /*
@@ -57,6 +65,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef OS_WIN32
+#include <io.h>
+#endif /*OS_WIN32*/
 
 #include <vips/vips.h>
 #include <vips/internal.h>
@@ -84,10 +95,40 @@
 #define MODE_READWRITE BINARYIZE (O_RDWR)
 #define MODE_WRITE BINARYIZE (O_WRONLY | O_CREAT | O_TRUNC)
 
+/* -1 on a pipe isn't actually unbounded. Have a limit to prevent
+ * huge sources accidentally filling memory.
+ *
+ * This can be configured with vips_pipe_read_limit_set().
+ */
+static gint64 vips__pipe_read_limit = 1024 * 1024 * 1024;
+
+/**
+ * vips_pipe_read_limit_set:
+ * @limit: maximum number of bytes to buffer from a pipe
+ *
+ * If a source does not support mmap or seek and the source is
+ * used with a loader that can only work from memory, then the data will be
+ * automatically read into memory to EOF before the loader starts. This can
+ * produce high memory use if the descriptor represents a large object.
+ *
+ * Use vips_pipe_read_limit_set() to limit the size of object that
+ * will be read in this way. The default is 1GB. 
+ *
+ * Set a value of -1 to mean no limit.
+ *
+ * See also: `--vips-pipe-read-limit` and the environment variable 
+ * `VIPS_PIPE_READ_LIMIT`.
+ */
+void
+vips_pipe_read_limit_set( gint64 limit )
+{
+	vips__pipe_read_limit = limit;
+}
+
 G_DEFINE_TYPE( VipsSource, vips_source, VIPS_TYPE_CONNECTION );
 
 /* We can't test for seekability or length during _build, since the read and 
- * seek signal handlers may not have been connected yet. Instead, we test 
+ * seek signal handlers might not have been connected yet. Instead, we test 
  * when we first need to know.
  */
 static int
@@ -184,6 +225,9 @@ vips_source_sanity( VipsSource *source )
 		g_assert( source->length == -1 );
 	}
 	else {
+		/* Something like a seekable file.
+		 */
+
 		/* After we're done with the header, the sniff buffer should
 		 * be gone.
 		 */
@@ -221,6 +265,8 @@ static void
 vips_source_finalize( GObject *gobject )
 {
 	VipsSource *source = VIPS_SOURCE( gobject );
+
+	VIPS_DEBUG_MSG( "vips_source_finalize: %p\n", source );
 
 	VIPS_FREEF( g_byte_array_unref, source->header_bytes ); 
 	VIPS_FREEF( g_byte_array_unref, source->sniff ); 
@@ -260,6 +306,13 @@ vips_source_build( VipsObject *object )
 	if( vips_object_argument_isset( object, "descriptor" ) ) {
 		connection->descriptor = dup( connection->descriptor );
 		connection->close_descriptor = connection->descriptor;
+
+#ifdef OS_WIN32
+		/* Windows will create eg. stdin and stdout in text mode.
+		 * We always read in binary mode.
+		 */
+		_setmode( connection->descriptor, _O_BINARY );
+#endif /*OS_WIN32*/
 	}
 
 	if( vips_object_argument_isset( object, "blob" ) ) {
@@ -376,6 +429,14 @@ vips_source_new_from_descriptor( int descriptor )
  * @descriptor: read from this filename 
  *
  * Create an source attached to a file.
+ *
+ * If this descriptor does not support mmap and the source is
+ * used with a loader that can only work from memory, then the data will be
+ * automatically read into memory to EOF before the loader starts. This can
+ * produce high memory use if the descriptor represents a large object.
+ *
+ * Use vips_pipe_read_limit_set() to limit the size of object that
+ * will be read in this way. The default is 1GB.
  *
  * Returns: a new source.
  */
@@ -509,8 +570,6 @@ vips_source_minimise( VipsSource *source )
 {
 	VipsConnection *connection = VIPS_CONNECTION( source );
 
-	VIPS_DEBUG_MSG( "vips_source_minimise:\n" );
-
 	SANITY( source );
 
 	(void) vips_source_test_features( source );
@@ -519,7 +578,7 @@ vips_source_minimise( VipsSource *source )
 		connection->descriptor != -1 &&
 		connection->tracked_descriptor == connection->descriptor &&
 		!source->is_pipe ) {
-		VIPS_DEBUG_MSG( "    tracked_close()\n" );
+		VIPS_DEBUG_MSG( "vips_source_minimise:\n" );
 		vips_tracked_close( connection->tracked_descriptor );
 		connection->tracked_descriptor = -1;
 		connection->descriptor = -1;
@@ -544,15 +603,15 @@ vips_source_unminimise( VipsSource *source )
 {
 	VipsConnection *connection = VIPS_CONNECTION( source );
 
-	VIPS_DEBUG_MSG( "vips_source_unminimise:\n" );
-
 	if( connection->descriptor == -1 &&
 		connection->tracked_descriptor == -1 &&
 		connection->filename ) {
 		int fd;
 
+		VIPS_DEBUG_MSG( "vips_source_unminimise: %p\n", source );
+
 		if( (fd = vips_tracked_open( connection->filename, 
-			MODE_READ )) == -1 ) {
+			MODE_READ, 0 )) == -1 ) {
 			vips_error_system( errno, 
 				vips_connection_nick( connection ),
 				"%s", _( "unable to open for read" ) );
@@ -593,13 +652,15 @@ vips_source_decode( VipsSource *source )
 
 	SANITY( source );
 
-	/* We have finished reading the header. We can discard the header bytes
-	 * we saved.
-	 */
 	if( !source->decode ) {
 		source->decode = TRUE;
-		VIPS_FREEF( g_byte_array_unref, source->header_bytes ); 
 		VIPS_FREEF( g_byte_array_unref, source->sniff ); 
+
+		/* If this is still a pipe source, we can discard the header 
+		 * bytes we saved.
+		 */
+		if( source->is_pipe ) 
+			VIPS_FREEF( g_byte_array_unref, source->header_bytes ); 
 	}
 
 	vips_source_minimise( source );
@@ -608,6 +669,25 @@ vips_source_decode( VipsSource *source )
 
 	return( 0 );
 }
+
+#ifdef VIPS_DEBUG
+static void
+vips_source_print( VipsSource *source )
+{
+	printf( "vips_source_print: %p\n", source );
+	printf( "  source->read_position = %zd\n", source->read_position );
+	printf( "  source->is_pipe = %d\n", source->is_pipe );
+	printf( "  source->length = %zd\n", source->length );
+	printf( "  source->data = %p\n", source->data );
+	printf( "  source->header_bytes = %p\n", source->header_bytes );
+	if( source->header_bytes ) 
+		printf( "  source->header_bytes->len = %d\n", 
+			source->header_bytes->len );
+	printf( "  source->sniff = %p\n", source->sniff );
+	if( source->sniff )
+		printf( "  source->sniff->len = %d\n", source->sniff->len );
+}
+#endif /*VIPS_DEBUG*/
 
 /**
  * vips_source_read:
@@ -715,39 +795,28 @@ vips_source_read( VipsSource *source, void *buffer, size_t length )
 	return( total_read );
 }
 
-/* -1 on a pipe isn't actually unbounded. Have a limit to prevent
- * huge sources accidentally filling memory.
+/* Read to a position. 
  *
- * 1gb. Why not.
- */
-static const int vips_pipe_read_limit = 1024 * 1024 * 1024;
-
-/* Read to a position. -1 means read to end of source. Does not change 
- * read_position.
+ * target == -1 means read to end of source -- useful for forcing a pipe into
+ * memory, for example. This will always set length to the pipe length.
+ *
+ * If we hit EOF and we're buffering, set length on the pipe and turn it into
+ * a memory source.
+ *
+ * read_position is left somewhere indeterminate.
  */
 static int
 vips_source_pipe_read_to_position( VipsSource *source, gint64 target )
 {
-	gint64 old_read_position;
+	const char *nick = vips_connection_nick( VIPS_CONNECTION( source ) );
+
 	unsigned char buffer[4096];
 
-	VIPS_DEBUG_MSG( "vips_source_pipe_read_position: %" G_GINT64_FORMAT 
-		"\n", target );
-
-	g_assert( !source->decode );
-	g_assert( source->header_bytes );
+	/* This is only useful for pipes (sources where we don't know the
+	 * length).
+	 */
+	g_assert( source->length == -1 );
 	g_assert( source->is_pipe );
-
-	if( target != -1 &&
-		(target < 0 ||
-			(source->length != -1 && 
-			 target > source->length)) ) {
-		vips_error( vips_connection_nick( VIPS_CONNECTION( source ) ), 
-			_( "bad read to %" G_GINT64_FORMAT ), target );
-		return( -1 );
-	}
-
-	old_read_position = source->read_position;
 
 	while( target == -1 ||
 		source->read_position < target ) {
@@ -756,18 +825,34 @@ vips_source_pipe_read_to_position( VipsSource *source, gint64 target )
 		bytes_read = vips_source_read( source, buffer, 4096 );
 		if( bytes_read == -1 )
 			return( -1 );
-		if( bytes_read == 0 )
+
+		if( bytes_read == 0 ) {
+			/* No more bytes available, we must be at EOF.
+			 */
+			source->length = source->read_position;
+
+			/* Have we been buffering the whole thing? We can
+			 * become a memory source.
+			 */
+			if( source->header_bytes ) {
+				source->data = source->header_bytes->data;
+				source->is_pipe = FALSE;
+
+				/* TODO ... we could close more fds here.
+				 */
+				vips_source_minimise( source );
+			}
+
 			break;
+		}
 
 		if( target == -1 &&
-			source->read_position > vips_pipe_read_limit ) {
-			vips_error( vips_connection_nick( VIPS_CONNECTION( source ) ), 
-				"%s", _( "pipe too long" ) );
+			vips__pipe_read_limit != -1 &&
+			source->read_position > vips__pipe_read_limit ) {
+			vips_error( nick, "%s", _( "pipe too long" ) );
 			return( -1 );
 		}
 	}
-
-	source->read_position = old_read_position;
 
 	return( 0 );
 }
@@ -798,8 +883,6 @@ vips_source_read_to_memory( VipsSource *source )
 	byte_array = g_byte_array_new();
 	g_byte_array_set_size( byte_array, source->length );
 
-	/* Read in a series of chunks to reduce stress upstream.
-	 */
 	read_position = 0;
 	q = byte_array->data;
 	while( read_position < source->length ) {
@@ -827,34 +910,6 @@ vips_source_read_to_memory( VipsSource *source )
 	source->is_pipe = FALSE;
 	source->header_bytes = byte_array;
 
-	vips_source_minimise( source );
-
-	return( 0 );
-}
-
-/* Read the entire pipe into memory and turn this into a memory source.
- */
-static int
-vips_source_pipe_to_memory( VipsSource *source )
-{
-	VIPS_DEBUG_MSG( "vips_source_pipe_to_memory:\n" );
-
-	g_assert( source->is_pipe );
-	g_assert( !source->blob );
-	g_assert( !source->decode );
-	g_assert( source->header_bytes );
-
-	if( vips_source_pipe_read_to_position( source, -1 ) )
-		return( -1 );
-
-	/* Steal the header_bytes pointer and turn into a memory source.
-	 */
-	source->length = source->header_bytes->len;
-	source->data = source->header_bytes->data;
-	source->is_pipe = FALSE;
-
-	/* TODO ... we could close more fds here.
-	 */
 	vips_source_minimise( source );
 
 	return( 0 );
@@ -947,7 +1002,7 @@ vips_source_map( VipsSource *source, size_t *length_out )
 				return( NULL );
 		}
 		else {
-			if( vips_source_pipe_to_memory( source ) )
+			if( vips_source_pipe_read_to_position( source, -1 ) )
 				return( NULL );
 		}
 	}
@@ -961,9 +1016,8 @@ vips_source_map( VipsSource *source, size_t *length_out )
 }
 
 static int
-vips_source_map_cb( void *a, void *b )
+vips_source_map_cb( void *a, VipsArea *area )
 {
-	VipsArea *area = VIPS_AREA( b );
 	GObject *gobject = G_OBJECT( area->client );
 
 	VIPS_UNREF( gobject );
@@ -988,7 +1042,8 @@ vips_source_map_blob( VipsSource *source )
 	VipsBlob *blob;
 
 	if( !(buf = vips_source_map( source, &len )) ||
-		!(blob = vips_blob_new( vips_source_map_cb, buf, len )) ) 
+		!(blob = vips_blob_new( (VipsCallbackFn) vips_source_map_cb, 
+			buf, len )) ) 
 		return( NULL );
 
 	/* The source must stay alive until the blob is done.
@@ -1013,6 +1068,7 @@ vips_source_map_blob( VipsSource *source )
 gint64
 vips_source_seek( VipsSource *source, gint64 offset, int whence )
 {
+	const char *nick = vips_connection_nick( VIPS_CONNECTION( source ) );
 	VipsSourceClass *class = VIPS_SOURCE_GET_CLASS( source );
 
 	gint64 new_pos;
@@ -1039,8 +1095,7 @@ vips_source_seek( VipsSource *source, gint64 offset, int whence )
 			break;
 
 		default:
-			vips_error( vips_connection_nick( VIPS_CONNECTION( source ) ), 
-				"%s", _( "bad 'whence'" ) );
+			vips_error( nick, "%s", _( "bad 'whence'" ) );
 			return( -1 );
 		}
 	}
@@ -1058,16 +1113,14 @@ vips_source_seek( VipsSource *source, gint64 offset, int whence )
 			/* We have to read the whole source into memory to get
 			 * the length.
 			 */
-			if( source->length == -1 &&
-				vips_source_pipe_to_memory( source ) )
+			if( vips_source_pipe_read_to_position( source, -1 ) )
 				return( -1 );
 
 			new_pos = source->length + offset;
 			break;
 
 		default:
-			vips_error( vips_connection_nick( VIPS_CONNECTION( source ) ), 
-				"%s", _( "bad 'whence'" ) );
+			vips_error( nick, "%s", _( "bad 'whence'" ) );
 			return( -1 );
 		}
 	}
@@ -1076,21 +1129,22 @@ vips_source_seek( VipsSource *source, gint64 offset, int whence )
 			return( -1 );
 	}
 
+	/* For pipes, we have to fake seek by reading to that point. This
+	 * might hit EOF and turn the pipe into a memory source.
+	 */
+	if( source->is_pipe &&
+		vips_source_pipe_read_to_position( source, new_pos ) )
+		return( -1 );
+
 	/* Don't allow out of range seeks.
 	 */
 	if( new_pos < 0 ||
 		(source->length != -1 && 
 		 new_pos > source->length) ) {
-		vips_error( vips_connection_nick( VIPS_CONNECTION( source ) ), 
+		vips_error( nick, 
 			_( "bad seek to %" G_GINT64_FORMAT ), new_pos );
                 return( -1 );
 	}
-
-	/* For pipes, we have to fake seek by reading to that point.
-	 */
-	if( source->is_pipe &&
-		vips_source_pipe_read_to_position( source, new_pos ) )
-		return( -1 );
 
 	source->read_position = new_pos;
 
@@ -1165,7 +1219,7 @@ vips_source_length( VipsSource *source )
  *
  * Returns: number of bytes read, or -1 on error.
  */
-size_t
+gint64
 vips_source_sniff_at_most( VipsSource *source, 
 	unsigned char **data, size_t length )
 {
@@ -1225,7 +1279,9 @@ vips_source_sniff( VipsSource *source, size_t length )
 		return( NULL );
 
 	bytes_read = vips_source_sniff_at_most( source, &data, length );
-	if( bytes_read < (gint64) length )
+	if( bytes_read == -1 )
+		return( NULL );
+	if( bytes_read < length )
 		return( NULL );
 
 	return( data );

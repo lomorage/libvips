@@ -4,6 +4,12 @@
  * 	- wrap a class around the ppm writer
  * 13/11/19
  * 	- redone with targets
+ * 18/6/20
+ * 	- add "bitdepth" param, cf. tiffsave
+ * 27/6/20
+ * 	- add ppmsave_target
+ * 20/11/20
+ * 	- byteswap on save, if necessary [ewelot]
  */
 
 /*
@@ -58,15 +64,19 @@ typedef struct _VipsForeignSavePpm VipsForeignSavePpm;
 
 typedef int (*VipsSavePpmFn)( VipsForeignSavePpm *, VipsImage *, VipsPel * );
 
-typedef struct _VipsForeignSavePpm {
+struct _VipsForeignSavePpm {
 	VipsForeignSave parent_object;
 
 	VipsTarget *target;
 	gboolean ascii;
-	gboolean squash;
+	int bitdepth;
 
 	VipsSavePpmFn fn;
-} VipsForeignSavePpm;
+
+	/* Deprecated.
+	 */
+	gboolean squash;
+};
 
 typedef VipsForeignSaveClass VipsForeignSavePpmClass;
 
@@ -123,7 +133,7 @@ vips_foreign_save_ppm_line_ascii( VipsForeignSavePpm *ppm,
 }
 
 static int
-vips_foreign_save_ppm_line_ascii_squash( VipsForeignSavePpm *ppm, 
+vips_foreign_save_ppm_line_ascii_1bit( VipsForeignSavePpm *ppm, 
         VipsImage *image, VipsPel *p )
 {
 	int x;
@@ -149,7 +159,7 @@ vips_foreign_save_ppm_line_binary( VipsForeignSavePpm *ppm,
 }
 
 static int
-vips_foreign_save_ppm_line_binary_squash( VipsForeignSavePpm *ppm, 
+vips_foreign_save_ppm_line_binary_1bit( VipsForeignSavePpm *ppm, 
 	VipsImage *image, VipsPel *p )
 {
 	int x;
@@ -161,7 +171,7 @@ vips_foreign_save_ppm_line_binary_squash( VipsForeignSavePpm *ppm,
 	for( x = 0; x < image->Xsize; x++ ) {
 		bits = VIPS_LSHIFT_INT( bits, 1 );
 		n_bits += 1;
-		bits |= p[x] ? 0 : 1;
+		bits |= p[x] > 128 ? 0 : 1;
 
 		if( n_bits == 8 ) {
 			if( VIPS_TARGET_PUTC( ppm->target, bits ) ) 
@@ -186,10 +196,11 @@ vips_foreign_save_ppm_block( VipsRegion *region, VipsRect *area, void *a )
 {
 	VipsForeignSavePpm *ppm = (VipsForeignSavePpm *) a;
 	VipsImage *image = region->im;
-	int i;
 
-	for( i = 0; i < area->height; i++ ) {
-		VipsPel *p = VIPS_REGION_ADDR( region, 0, area->top + i );
+	int y;
+
+	for( y = 0; y < area->height; y++ ) {
+		VipsPel *p = VIPS_REGION_ADDR( region, 0, area->top + y );
 
 		if( ppm->fn( ppm, image, p ) )
 			return( -1 );
@@ -213,14 +224,14 @@ vips_foreign_save_ppm( VipsForeignSavePpm *ppm, VipsImage *image )
 		magic = "Pf";
 	else if( image->Bands == 1 && 
 		ppm->ascii && 
-		ppm->squash )
+		ppm->bitdepth )
 		magic = "P1";
 	else if( image->Bands == 1 && 
 		ppm->ascii )
 		magic = "P2";
 	else if( image->Bands == 1 && 
 		!ppm->ascii && 
-		ppm->squash )
+		ppm->bitdepth )
 		magic = "P4";
 	else if( image->Bands == 1 && 
 		!ppm->ascii )
@@ -242,7 +253,7 @@ vips_foreign_save_ppm( VipsForeignSavePpm *ppm, VipsImage *image )
 	vips_target_writef( ppm->target, 
 		"%d %d\n", image->Xsize, image->Ysize );
 
-	if( !ppm->squash ) 
+	if( !ppm->bitdepth ) 
 		switch( image->BandFmt ) {
 		case VIPS_FORMAT_UCHAR:
 			vips_target_writef( ppm->target, 
@@ -280,17 +291,32 @@ vips_foreign_save_ppm( VipsForeignSavePpm *ppm, VipsImage *image )
 			g_assert_not_reached();
 		}
 
-	if( ppm->squash )
+	if( ppm->bitdepth )
 		ppm->fn = ppm->ascii ? 
-			vips_foreign_save_ppm_line_ascii_squash : 
-			vips_foreign_save_ppm_line_binary_squash;
+			vips_foreign_save_ppm_line_ascii_1bit : 
+			vips_foreign_save_ppm_line_binary_1bit;
 	else
 		ppm->fn = ppm->ascii ? 
 			vips_foreign_save_ppm_line_ascii : 
 			vips_foreign_save_ppm_line_binary;
 
+	/* 16 and 32-bit binary write might need byteswapping.
+	 */
+	if( !ppm->ascii &&
+		(image->BandFmt == VIPS_FORMAT_USHORT ||
+		 image->BandFmt == VIPS_FORMAT_UINT) ) {
+		VipsImage *x;
+
+		if( vips__byteswap_bool( image, &x, !vips_amiMSBfirst() ) )
+			return( -1 );
+		VIPS_UNREF( image );
+		image = x;
+	}
+
 	if( vips_sink_disc( image, vips_foreign_save_ppm_block, ppm ) )
 		return( -1 );
+
+	vips_target_finish( ppm->target );
 
 	return( 0 );
 }
@@ -306,6 +332,11 @@ vips_foreign_save_ppm_build( VipsObject *object )
 	if( VIPS_OBJECT_CLASS( vips_foreign_save_ppm_parent_class )->
 		build( object ) )
 		return( -1 );
+
+        /* Handle the deprecated squash parameter.
+	 */
+        if( vips_object_argument_isset( object, "squash" ) ) 
+		ppm->bitdepth = 1;
 
 	image = save->ready;
 	if( vips_check_uintorf( "vips2ppm", image ) || 
@@ -323,13 +354,13 @@ vips_foreign_save_ppm_build( VipsObject *object )
 
 	/* One bit images must come from a 8 bit, one band source. 
 	 */
-	if( ppm->squash && 
+	if( ppm->bitdepth && 
 		(image->Bands != 1 || 
 		 image->BandFmt != VIPS_FORMAT_UCHAR) ) {
 		g_warning( "%s", 
-			_( "can only squash 1 band uchar images -- " 
-				"disabling squash" ) );
-		ppm->squash = FALSE; 
+			_( "can only save 1 band uchar images as 1 bit -- " 
+				"disabling 1 bit save" ) );
+		ppm->bitdepth = 0; 
 	}
 
 	if( vips_foreign_save_ppm( ppm, image ) )
@@ -384,10 +415,17 @@ vips_foreign_save_ppm_class_init( VipsForeignSavePpmClass *class )
 		G_STRUCT_OFFSET( VipsForeignSavePpm, ascii ),
 		FALSE );
 
+	VIPS_ARG_INT( class, "bitdepth", 15,
+		_( "bitdepth" ),
+		_( "set to 1 to write as a 1 bit image" ),
+		VIPS_ARGUMENT_OPTIONAL_INPUT,
+		G_STRUCT_OFFSET( VipsForeignSavePpm, bitdepth ),
+		0, 1, 0 );
+
 	VIPS_ARG_BOOL( class, "squash", 11, 
 		_( "Squash" ), 
 		_( "save as one bit" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
+		VIPS_ARGUMENT_OPTIONAL_INPUT | VIPS_ARGUMENT_DEPRECATED,
 		G_STRUCT_OFFSET( VipsForeignSavePpm, squash ),
 		FALSE );
 
@@ -450,6 +488,60 @@ vips_foreign_save_ppm_file_init( VipsForeignSavePpmFile *file )
 {
 }
 
+typedef struct _VipsForeignSavePpmTarget {
+	VipsForeignSavePpm parent_object;
+
+	VipsTarget *target;
+} VipsForeignSavePpmTarget;
+
+typedef VipsForeignSavePpmClass VipsForeignSavePpmTargetClass;
+
+G_DEFINE_TYPE( VipsForeignSavePpmTarget, vips_foreign_save_ppm_target, 
+	vips_foreign_save_ppm_get_type() );
+
+static int
+vips_foreign_save_ppm_target_build( VipsObject *object )
+{
+	VipsForeignSavePpm *ppm = (VipsForeignSavePpm *) object;
+	VipsForeignSavePpmTarget *target = 
+		(VipsForeignSavePpmTarget *) object;
+
+	if( target->target ) {
+		ppm->target = target->target; 
+		g_object_ref( ppm->target );
+	}
+
+	return( VIPS_OBJECT_CLASS( 
+		vips_foreign_save_ppm_target_parent_class )->
+			build( object ) );
+}
+
+static void
+vips_foreign_save_ppm_target_class_init( 
+	VipsForeignSavePpmTargetClass *class )
+{
+	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+	VipsObjectClass *object_class = (VipsObjectClass *) class;
+
+	gobject_class->set_property = vips_object_set_property;
+	gobject_class->get_property = vips_object_get_property;
+
+	object_class->nickname = "ppmsave_target";
+	object_class->build = vips_foreign_save_ppm_target_build;
+
+	VIPS_ARG_OBJECT( class, "target", 1,
+		_( "Target" ),
+		_( "Target to save to" ),
+		VIPS_ARGUMENT_REQUIRED_INPUT, 
+		G_STRUCT_OFFSET( VipsForeignSavePpmTarget, target ),
+		VIPS_TYPE_TARGET );
+
+}
+
+static void
+vips_foreign_save_ppm_target_init( VipsForeignSavePpmTarget *target )
+{
+}
 
 #endif /*HAVE_PPM*/
 
@@ -490,6 +582,31 @@ vips_ppmsave( VipsImage *in, const char *filename, ... )
 
 	va_start( ap, filename );
 	result = vips_call_split( "ppmsave", ap, in, filename );
+	va_end( ap );
+
+	return( result );
+}
+
+/**
+ * vips_ppmsave_target: (method)
+ * @in: image to save 
+ * @target: save image to this target
+ * @...: %NULL-terminated list of optional named arguments
+ *
+ * As vips_ppmsave(), but save to a target.
+ *
+ * See also: vips_ppmsave().
+ *
+ * Returns: 0 on success, -1 on error.
+ */
+int
+vips_ppmsave_target( VipsImage *in, VipsTarget *target, ... )
+{
+	va_list ap;
+	int result;
+
+	va_start( ap, target );
+	result = vips_call_split( "ppmsave_target", ap, in, target );
 	va_end( ap );
 
 	return( result );

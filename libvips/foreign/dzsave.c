@@ -85,6 +85,8 @@
  * 	- add @no_strip
  * 9/11/19
  * 	- add IIIF layout
+ * 24/4/20 [IllyaMoskvin]
+ * 	- better IIIF tile naming
  */
 
 /*
@@ -216,13 +218,22 @@ typedef struct _VipsGsfDirectory {
 
 } VipsGsfDirectory; 
 
+static void *vips_gsf_tree_close( VipsGsfDirectory *tree );
+
+static void *
+vips_gsf_tree_close_cb( void *item, void *a, void *b )
+{
+	VipsGsfDirectory *tree = (VipsGsfDirectory *) item;
+
+	return( vips_gsf_tree_close( tree ) );
+}
+
 /* Close all dirs, non-NULL on error.
  */
 static void *
 vips_gsf_tree_close( VipsGsfDirectory *tree )
 {
-	vips_slist_map2( tree->children, 
-		(VipsSListMap2Fn) vips_gsf_tree_close, NULL, NULL );
+	vips_slist_map2( tree->children, vips_gsf_tree_close_cb, NULL, NULL );
 
 	if( tree->out ) {
 		if( !gsf_output_is_closed( tree->out ) &&
@@ -273,7 +284,7 @@ vips_gsf_tree_new( GsfOutput *out, gint deflate_level )
 }
 
 static void *
-vips_gsf_child_by_name_sub( VipsGsfDirectory *dir, const char *name )
+vips_gsf_child_by_name_sub( VipsGsfDirectory *dir, const char *name, void *b )
 {
 	if( strcmp( dir->name, name ) == 0 )
 		return( dir );
@@ -459,6 +470,7 @@ struct _VipsForeignSaveDz {
 	VipsRegionShrink region_shrink;
 	int skip_blanks;
 	gboolean no_strip;
+	char *id;
 
 	/* Tile and overlap geometry. The members above are the parameters we
 	 * accept, this next set are the derived values which are actually 
@@ -601,8 +613,8 @@ write_image( VipsForeignSaveDz *dz,
 	if( vips_copy( image, &t, NULL ) ) 
 		return( -1 );
 
-	/* We default to stripping all metadata. Only "no_strip" turns this
-	 * off. Very few people really want metadata on every tile.
+	/* We default to stripping all metadata. "no_strip" turns this
+	 * off. Most people don't want metadata on every tile.
 	 */
 	vips_image_set_int( t, "hide-progress", 1 );
 	if( vips_image_write_to_buffer( t, format, &buf, &len,
@@ -972,7 +984,7 @@ write_json( VipsForeignSaveDz *dz )
 	gsf_output_printf( out, 
 		"{\n"
 		"  \"@context\": \"http://iiif.io/api/image/2/context.json\",\n"
-		"  \"@id\": \"https://example.com/iiif/%s\",\n" 
+		"  \"@id\": \"%s/%s\",\n" 
 		"  \"profile\": [\n"
 		"    \"http://iiif.io/api/image/2/level0.json\",\n"
 		"    {\n" 
@@ -985,7 +997,9 @@ write_json( VipsForeignSaveDz *dz )
 		"    }\n"
 		"  ],\n"
 		"  \"protocol\": \"http://iiif.io/api/image\",\n", 
-		name, suffix );
+		dz->id ? dz->id : "https://example.com/iiif",
+		name, 
+		suffix );
 
 	/* "sizes" is needed for the full/ set of untiled images, which we 
 	 * don't yet support. Leave this commented out for now.
@@ -1015,7 +1029,7 @@ write_json( VipsForeignSaveDz *dz )
 	gsf_output_printf( out, 
 		"  \"tiles\": [\n"
 		"    {\n"
-		"      \"scalefactors\": [\n" );
+		"      \"scaleFactors\": [\n" );
 
 	for( i = 0; i < dz->layer->n; i++ ) {
 		gsf_output_printf( out, 
@@ -1035,8 +1049,8 @@ write_json( VipsForeignSaveDz *dz )
 	gsf_output_printf( out, 
 		"  \"width\": %d,\n"
 		"  \"height\": %d\n", 
-			dz->layer->image->Xsize,
-			dz->layer->image->Ysize );
+			dz->layer->width,
+			dz->layer->height );
 
 	gsf_output_printf( out, 
 		"}\n" );
@@ -1298,6 +1312,13 @@ strip_init( Strip *strip, Layer *layer )
 		return;
 	}
 
+	/* The strip needs to inherit the layer's metadata.
+	 */
+	if( vips__image_meta_copy( strip->image, layer->image ) ) {
+		strip_free( strip );
+		return;
+	}
+
 	/* Type needs to be set so we know how to convert for save correctly.
 	 */
 	strip->image->Type = layer->image->Type;
@@ -1357,6 +1378,7 @@ static GsfOutput *
 tile_name( Layer *layer, int x, int y )
 {
 	VipsForeignSaveDz *dz = layer->dz;
+	VipsForeignSave *save = (VipsForeignSave *) dz;
 
 	GsfOutput *out; 
 	char name[VIPS_PATH_MAX];
@@ -1419,13 +1441,16 @@ tile_name( Layer *layer, int x, int y )
 {
 		/* Tiles are addressed in full resolution coordinates, so
 		 * scale up by layer->sub and dz->tile_size
+		 *
+		 * We always clip against the full-sized image, not the scaled
+		 * up layer.
 		 */
 		int left = x * dz->tile_size * layer->sub;
 		int top = y * dz->tile_size * layer->sub;
 		int width = VIPS_MIN( dz->tile_size * layer->sub, 
-			layer->width * layer->sub - left );
+			save->ready->Xsize - left );
 		int height = VIPS_MIN( dz->tile_size * layer->sub, 
-			layer->height * layer->sub - top );
+			save->ready->Ysize - top );
 
 		/* IIIF "size" is just real tile width, I think.
 		 *
@@ -2497,6 +2522,13 @@ vips_foreign_save_dz_class_init( VipsForeignSaveDzClass *class )
 		G_STRUCT_OFFSET( VipsForeignSaveDz, no_strip ),
 		FALSE );
 
+	VIPS_ARG_STRING( class, "id", 21, 
+		_( "id" ), 
+		_( "Resource ID" ),
+		VIPS_ARGUMENT_OPTIONAL_INPUT,
+		G_STRUCT_OFFSET( VipsForeignSaveDz, id ),
+		"https://example.com/iiif" );
+
 	/* How annoying. We stupidly had these in earlier versions.
 	 */
 
@@ -2676,7 +2708,7 @@ vips_foreign_save_dz_buffer_build( VipsObject *object )
 		gsf_output_memory_get_bytes( GSF_OUTPUT_MEMORY( dz->out ) ),
 		olen ); 
 
-	blob = vips_blob_new( (VipsCallbackFn) g_free, obuf, olen );
+	blob = vips_blob_new( (VipsCallbackFn) vips_area_free_cb, obuf, olen );
 	g_object_set( object, "buffer", blob, NULL );
 	vips_area_unref( VIPS_AREA( blob ) );
 
@@ -2724,9 +2756,9 @@ vips_foreign_save_dz_buffer_init( VipsForeignSaveDzBuffer *buffer )
  *
  * Optional arguments:
  *
- * * @basename: %gchar, base part of name
+ * * @basename: %gchar base part of name
  * * @layout: #VipsForeignDzLayout directory layout convention
- * * @suffix: suffix for tile tiles 
+ * * @suffix: %gchar suffix for tiles 
  * * @overlap: %gint set tile overlap 
  * * @tile_size: %gint set tile size 
  * * @background: #VipsArrayDouble background colour
@@ -2739,6 +2771,7 @@ vips_foreign_save_dz_buffer_init( VipsForeignSaveDzBuffer *buffer )
  * * @region_shrink: #VipsRegionShrink how to shrink each 2x2 region
  * * @skip_blanks: %gint skip tiles which are nearly equal to the background
  * * @no_strip: %gboolean don't strip tiles
+ * * @id: %gchar id for IIIF properties
  *
  * Save an image as a set of tiles at various resolutions. By default dzsave
  * uses DeepZoom layout -- use @layout to pick other conventions.
@@ -2794,6 +2827,9 @@ vips_foreign_save_dz_buffer_init( VipsForeignSaveDzBuffer *buffer )
  * which are all within that many pixel values to the background are skipped. 
  * This can save a lot of space for some image types. This option defaults to 
  * 5 in Google layout mode, -1 otherwise.
+ *
+ * In IIIF layout, you can set the base of the `id` property in `info.json` 
+ * with @id. The default is `https://example.com/iiif`.
  * 
  * See also: vips_tiffsave().
  *
@@ -2821,9 +2857,9 @@ vips_dzsave( VipsImage *in, const char *name, ... )
  *
  * Optional arguments:
  *
- * * @basename: %gchar, base part of name
+ * * @basename: %gchar base part of name
  * * @layout: #VipsForeignDzLayout directory layout convention
- * * @suffix: suffix for tile tiles 
+ * * @suffix: %gchar suffix for tiles 
  * * @overlap: %gint set tile overlap 
  * * @tile_size: %gint set tile size 
  * * @background: #VipsArrayDouble background colour
@@ -2836,6 +2872,7 @@ vips_dzsave( VipsImage *in, const char *name, ... )
  * * @region_shrink: #VipsRegionShrink how to shrink each 2x2 region.
  * * @skip_blanks: %gint skip tiles which are nearly equal to the background
  * * @no_strip: %gboolean don't strip tiles
+ * * @id: %gchar id for IIIF properties
  *
  * As vips_dzsave(), but save to a memory buffer. 
  *

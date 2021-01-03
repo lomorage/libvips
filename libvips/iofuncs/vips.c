@@ -94,10 +94,6 @@
 #include <expat.h>
 #include <errno.h>
 
-#ifdef OS_WIN32
-#include <windows.h>
-#endif /*OS_WIN32*/
-
 #include <vips/vips.h>
 #include <vips/internal.h>
 #include <vips/debug.h>
@@ -165,11 +161,11 @@ vips__open_image_read( const char *filename )
 	 * work. When we later mmap this file, we set read-only, so there 
 	 * is little danger of scrubbing over files we own.
 	 */
-	fd = vips_tracked_open( filename, MODE_READWRITE );
+	fd = vips_tracked_open( filename, MODE_READWRITE, 0 );
 	if( fd == -1 ) 
 		/* Open read-write failed. Fall back to open read-only.
 		 */
-		fd = vips_tracked_open( filename, MODE_READONLY );
+		fd = vips_tracked_open( filename, MODE_READONLY, 0 );
 	
 	if( fd == -1 ) {
 		vips_error_system( errno, "VipsImage", 
@@ -358,7 +354,7 @@ vips__read_header_bytes( VipsImage *im, unsigned char *from )
 	/* We need to swap for other fields if the file byte order is 
 	 * different from ours.
 	 */
-	swap = vips_amiMSBfirst() != (im->magic == VIPS_MAGIC_SPARC);
+	swap = vips_amiMSBfirst() != vips_image_isMSBfirst( im );
 
 	for( i = 0; i < VIPS_NUMBER( fields ); i++ ) {
 		fields[i].copy( swap,
@@ -439,7 +435,7 @@ vips__write_header_bytes( VipsImage *im, unsigned char *to )
 	/* Swap if the byte order we are asked to write the header in is
 	 * different from ours.
 	 */
-	gboolean swap = vips_amiMSBfirst() != (im->magic == VIPS_MAGIC_SPARC);
+	gboolean swap = vips_amiMSBfirst() != vips_image_isMSBfirst( im );
 
 	int i;
 	unsigned char *q;
@@ -490,7 +486,7 @@ read_chunk( int fd, gint64 offset, size_t length )
 	if( !(buf = vips_malloc( NULL, length + 1 )) )
 		return( NULL );
 	if( read( fd, buf, length ) != (ssize_t) length ) {
-		vips_free( buf );
+		g_free( buf );
 		vips_error( "VipsImage", "%s", _( "unable to read history" ) );
 		return( NULL );
 	}
@@ -828,7 +824,7 @@ target_write_quotes( VipsTarget *target, const char *str )
 }
 
 static void *
-build_xml_meta( VipsMeta *meta, VipsTarget *target )
+build_xml_meta( VipsMeta *meta, VipsTarget *target, void *b )
 {
 	GType type = G_VALUE_TYPE( &meta->value );
 

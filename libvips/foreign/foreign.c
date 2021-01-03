@@ -390,7 +390,7 @@ file_add_class( VipsForeignClass *class, GSList **files )
 }
 
 static gint
-file_compare( VipsForeignClass *a, VipsForeignClass *b )
+file_compare( VipsForeignClass *a, VipsForeignClass *b, void *user_data )
 {
         return( b->priority - a->priority );
 }
@@ -479,7 +479,7 @@ vips_foreign_load_summary_class( VipsObjectClass *object_class, VipsBuf *buf )
  */
 static void *
 vips_foreign_find_load_sub( VipsForeignLoadClass *load_class, 
-	const char *filename )
+	const char *filename, void *b )
 {
 	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( load_class );
 	VipsForeignClass *class = VIPS_FOREIGN_CLASS( load_class );
@@ -535,7 +535,12 @@ vips_foreign_find_load( const char *name )
 	 */
 	if( !vips_existsf( "%s", filename ) ) {
 		vips_error( "VipsForeignLoad", 
-			_( "file \"%s\" not found" ), name );
+			_( "file \"%s\" does not exist" ), name );
+		return( NULL );
+	}
+	if( vips_isdirf( "%s", filename ) ) {
+		vips_error( "VipsForeignLoad", 
+			_( "\"%s\" is a directory" ), name );
 		return( NULL );
 	}
 
@@ -1331,8 +1336,7 @@ vips__foreign_convert_saveable( VipsImage *in, VipsImage **ready,
 	}
 
 	/* If this image is CMYK and the saver is RGB-only, use lcms to try to
-	 * import to XYZ. This will only work if the image has an embedded
-	 * profile. 
+	 * import to XYZ. 
 	 */
 	if( in->Type == VIPS_INTERPRETATION_CMYK &&
 		in->Bands >= 4 &&
@@ -1343,6 +1347,8 @@ vips__foreign_convert_saveable( VipsImage *in, VipsImage **ready,
 
 		if( vips_icc_import( in, &out, 
 			"pcs", VIPS_PCS_XYZ,
+			"embedded", TRUE,
+			"input_profile", "cmyk",
 			NULL ) ) {
 			g_object_unref( in );
 			return( -1 );
@@ -1640,9 +1646,19 @@ vips_foreign_save_build( VipsObject *object )
 			save->background ) )
 			return( -1 );
 
-		if( save->page_height )
+		if( save->page_height ) {
+			VipsImage *x;
+
+			if( vips_copy( ready, &x, NULL ) ) {
+				VIPS_UNREF( ready );
+				return( -1 );
+			}
+			VIPS_UNREF( ready );
+			ready = x;
+
 			vips_image_set_int( ready, 
 				VIPS_META_PAGE_HEIGHT, save->page_height );
+		}
 
 		VIPS_UNREF( save->ready );
 		save->ready = ready;
@@ -1748,21 +1764,22 @@ vips_foreign_save_init( VipsForeignSave *save )
  */
 static void *
 vips_foreign_find_save_sub( VipsForeignSaveClass *save_class, 
-	const char *filename )
+	const char *filename, void *b )
 {
 	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( save_class );
 	VipsForeignClass *class = VIPS_FOREIGN_CLASS( save_class );
 
-	/* The suffs might be defined on an abstract base class, make sure we
-	 * don't pick that.
-	 *
-	 * Suffs can be defined on buffer and target writers too. Make sure
-	 * it's not one of those.
+	/* All concrete savers needs suffs, since we use the suff to pick the 
+	 * saver.
 	 */
 	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		!class->suffs )
+		g_warning( "no suffix defined for %s", object_class->nickname );
+
+	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		class->suffs &&
 		!vips_ispostfix( object_class->nickname, "_buffer" ) &&
 		!vips_ispostfix( object_class->nickname, "_target" ) &&
-		class->suffs &&
 		vips_filename_suffix_match( filename, class->suffs ) )
 		return( save_class );
 
@@ -1903,12 +1920,20 @@ vips_foreign_save( VipsImage *in, const char *name, ... )
  */
 static void *
 vips_foreign_find_save_target_sub( VipsForeignSaveClass *save_class, 
-	const char *suffix )
+	const char *suffix, void *b )
 {
 	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( save_class );
 	VipsForeignClass *class = VIPS_FOREIGN_CLASS( save_class );
 
-	if( class->suffs &&
+	/* All concrete savers needs suffs, since we use the suff to pick the 
+	 * saver.
+	 */
+	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		!class->suffs )
+		g_warning( "no suffix defined for %s", object_class->nickname );
+
+	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		class->suffs &&
 		vips_ispostfix( object_class->nickname, "_target" ) &&
 		vips_filename_suffix_match( suffix, class->suffs ) )
 		return( save_class );
@@ -1953,12 +1978,20 @@ vips_foreign_find_save_target( const char *name )
  */
 static void *
 vips_foreign_find_save_buffer_sub( VipsForeignSaveClass *save_class, 
-	const char *suffix )
+	const char *suffix, void *b )
 {
 	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( save_class );
 	VipsForeignClass *class = VIPS_FOREIGN_CLASS( save_class );
 
-	if( class->suffs &&
+	/* All concrete savers needs suffs, since we use the suff to pick the 
+	 * saver.
+	 */
+	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		!class->suffs )
+		g_warning( "no suffix defined for %s", object_class->nickname );
+
+	if( !G_TYPE_IS_ABSTRACT( G_TYPE_FROM_CLASS( class ) ) &&
+		class->suffs &&
 		vips_ispostfix( object_class->nickname, "_buffer" ) &&
 		vips_filename_suffix_match( suffix, class->suffs ) )
 		return( save_class );
@@ -2015,7 +2048,9 @@ vips_foreign_operation_init( void )
 	extern GType vips_foreign_load_mat_get_type( void ); 
 
 	extern GType vips_foreign_load_ppm_file_get_type( void ); 
+	extern GType vips_foreign_load_ppm_source_get_type( void ); 
 	extern GType vips_foreign_save_ppm_file_get_type( void ); 
+	extern GType vips_foreign_save_ppm_target_get_type( void ); 
 
 	extern GType vips_foreign_load_png_file_get_type( void ); 
 	extern GType vips_foreign_load_png_buffer_get_type( void ); 
@@ -2024,11 +2059,15 @@ vips_foreign_operation_init( void )
 	extern GType vips_foreign_save_png_buffer_get_type( void ); 
 	extern GType vips_foreign_save_png_target_get_type( void ); 
 
-	extern GType vips_foreign_load_csv_get_type( void ); 
-	extern GType vips_foreign_save_csv_get_type( void ); 
+	extern GType vips_foreign_load_csv_file_get_type( void ); 
+	extern GType vips_foreign_load_csv_source_get_type( void ); 
+	extern GType vips_foreign_save_csv_file_get_type( void ); 
+	extern GType vips_foreign_save_csv_target_get_type( void ); 
 
-	extern GType vips_foreign_load_matrix_get_type( void ); 
-	extern GType vips_foreign_save_matrix_get_type( void ); 
+	extern GType vips_foreign_load_matrix_file_get_type( void ); 
+	extern GType vips_foreign_load_matrix_source_get_type( void ); 
+	extern GType vips_foreign_save_matrix_file_get_type( void ); 
+	extern GType vips_foreign_save_matrix_target_get_type( void ); 
 	extern GType vips_foreign_print_matrix_get_type( void ); 
 
 	extern GType vips_foreign_load_fits_get_type( void ); 
@@ -2078,9 +2117,9 @@ vips_foreign_operation_init( void )
 	extern GType vips_foreign_save_webp_buffer_get_type( void ); 
 	extern GType vips_foreign_save_webp_target_get_type( void ); 
 
-	extern GType vips_foreign_load_pdf_get_type( void ); 
 	extern GType vips_foreign_load_pdf_file_get_type( void ); 
 	extern GType vips_foreign_load_pdf_buffer_get_type( void ); 
+	extern GType vips_foreign_load_pdf_source_get_type( void ); 
 
 	extern GType vips_foreign_load_svg_file_get_type( void ); 
 	extern GType vips_foreign_load_svg_buffer_get_type( void ); 
@@ -2088,20 +2127,26 @@ vips_foreign_operation_init( void )
 
 	extern GType vips_foreign_load_heif_file_get_type( void ); 
 	extern GType vips_foreign_load_heif_buffer_get_type( void ); 
-	extern GType vips_foreign_save_heif_get_type( void ); 
+	extern GType vips_foreign_load_heif_source_get_type( void ); 
 	extern GType vips_foreign_save_heif_file_get_type( void ); 
 	extern GType vips_foreign_save_heif_buffer_get_type( void ); 
+	extern GType vips_foreign_save_heif_target_get_type( void ); 
 
 	extern GType vips_foreign_load_nifti_get_type( void ); 
 	extern GType vips_foreign_save_nifti_get_type( void ); 
 
 	extern GType vips_foreign_load_gif_file_get_type( void ); 
 	extern GType vips_foreign_load_gif_buffer_get_type( void ); 
+	extern GType vips_foreign_load_gif_source_get_type( void ); 
 
-	vips_foreign_load_csv_get_type(); 
-	vips_foreign_save_csv_get_type(); 
-	vips_foreign_load_matrix_get_type(); 
-	vips_foreign_save_matrix_get_type(); 
+	vips_foreign_load_csv_file_get_type(); 
+	vips_foreign_load_csv_source_get_type(); 
+	vips_foreign_save_csv_file_get_type(); 
+	vips_foreign_save_csv_target_get_type(); 
+	vips_foreign_load_matrix_file_get_type(); 
+	vips_foreign_load_matrix_source_get_type(); 
+	vips_foreign_save_matrix_file_get_type(); 
+	vips_foreign_save_matrix_target_get_type(); 
 	vips_foreign_print_matrix_get_type(); 
 	vips_foreign_load_raw_get_type(); 
 	vips_foreign_save_raw_get_type(); 
@@ -2115,7 +2160,9 @@ vips_foreign_operation_init( void )
 
 #ifdef HAVE_PPM
 	vips_foreign_load_ppm_file_get_type(); 
+	vips_foreign_load_ppm_source_get_type(); 
 	vips_foreign_save_ppm_file_get_type(); 
+	vips_foreign_save_ppm_target_get_type(); 
 #endif /*HAVE_PPM*/
 
 #ifdef HAVE_RADIANCE
@@ -2127,14 +2174,13 @@ vips_foreign_operation_init( void )
 	vips_foreign_save_rad_target_get_type(); 
 #endif /*HAVE_RADIANCE*/
 
-#ifdef HAVE_POPPLER
-	vips_foreign_load_pdf_get_type(); 
+#if defined(HAVE_POPPLER)
 	vips_foreign_load_pdf_file_get_type(); 
 	vips_foreign_load_pdf_buffer_get_type(); 
+	vips_foreign_load_pdf_source_get_type(); 
 #endif /*HAVE_POPPLER*/
 
 #ifdef HAVE_PDFIUM
-	vips_foreign_load_pdf_get_type(); 
 	vips_foreign_load_pdf_file_get_type(); 
 	vips_foreign_load_pdf_buffer_get_type(); 
 #endif /*HAVE_PDFIUM*/
@@ -2148,6 +2194,7 @@ vips_foreign_operation_init( void )
 #ifdef HAVE_GIFLIB
 	vips_foreign_load_gif_file_get_type(); 
 	vips_foreign_load_gif_buffer_get_type(); 
+	vips_foreign_load_gif_source_get_type(); 
 #endif /*HAVE_GIFLIB*/
 
 #ifdef HAVE_GSF
@@ -2163,6 +2210,12 @@ vips_foreign_operation_init( void )
 	vips_foreign_save_png_buffer_get_type(); 
 	vips_foreign_save_png_target_get_type(); 
 #endif /*HAVE_PNG*/
+
+#ifdef HAVE_SPNG
+	vips_foreign_load_png_file_get_type(); 
+	vips_foreign_load_png_buffer_get_type(); 
+	vips_foreign_load_png_source_get_type(); 
+#endif /*HAVE_SPNG*/
 
 #ifdef HAVE_MATIO
 	vips_foreign_load_mat_get_type(); 
@@ -2233,11 +2286,13 @@ vips_foreign_operation_init( void )
 #ifdef HAVE_HEIF_DECODER
 	vips_foreign_load_heif_file_get_type(); 
 	vips_foreign_load_heif_buffer_get_type(); 
+	vips_foreign_load_heif_source_get_type(); 
 #endif /*HAVE_HEIF_DECODER*/
 
 #ifdef HAVE_HEIF_ENCODER
 	vips_foreign_save_heif_file_get_type(); 
 	vips_foreign_save_heif_buffer_get_type(); 
+	vips_foreign_save_heif_target_get_type(); 
 #endif /*HAVE_HEIF_ENCODER*/
 
 	vips__foreign_load_operation = 
