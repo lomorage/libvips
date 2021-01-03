@@ -3,4 +3,4 @@ Version: 1.0
 Maintainer: Lomoware
 Architecture: amd64
 Description: lomo libvips
-Depends: libexif-dev, libjpeg-dev, libpng-dev, libglib2.0-dev, libexpat1, libfftw3-dev, liborc-0.4-dev, liblcms2-dev, libde265-0, libffi7, libpcre3, libheif-dev, gobject-introspection
+Depends: libexif-dev, libjpeg-dev, libpng-dev, libglib2.0-dev, libexpat1, libfftw3-dev, liborc-0.4-dev, liblcms2-dev, libde265-0, libffi7, libpcre3, libheif-dev, gobject-introspection, libwebp6, libwebpmux3, libwebpdemux2

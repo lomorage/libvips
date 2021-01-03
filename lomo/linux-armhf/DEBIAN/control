@@ -3,4 +3,4 @@ Version: 1.0
 Maintainer: Lomoware
 Architecture: armhf
 Description: lomo libvips
-Depends: libexif-dev, libjpeg-dev, libpng-dev, libglib2.0-dev, libexpat1, libfftw3-dev, liborc-0.4-dev, liblcms2-dev, libde265-0, libffi7, libpcre3, libheif-dev, gobject-introspection
+Depends: libexif12, libjpeg62-turbo, libpng16-16, libglib2.0-dev, libexpat1, libfftw3-bin, liblcms2-2, libde265-0, libffi6, libpcre3
