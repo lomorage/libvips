@@ -13,9 +13,7 @@ build-mac: clean
 	cd ../; CC=clang CXX=clang++ ./configure --prefix=${DIST}/usr/local --without-gsf  --without-magick  --without-OpenEXR --without-nifti --without-pdfium  --without-poppler --without-rsvg --without-openslide --without-matio  --without-cfitsio --without-libwebp --without-pangoft2 --without-tiff --without-giflib --without-imagequant; make; make install
 
 install-dep-pi: 
-	sudo apt install -y libexif12 libjpeg62-turbo libpng16-16 libglib2.0-dev libexpat1 libfftw3-bin liblcms2-2 libde265-0 libffi6 libpcre3
-	#
-	# 2. install libheif (osx brew) or build by itself (pi)
+	sudo apt install -y libexif12 libjpeg62-turbo libpng16-16 libglib2.0-dev libexpat1 libfftw3-bin liblcms2-2 libde265-0 libffi6 libpcre3 libheif-dev libjpeg-dev libwebp-dev libwebp6 libwebpmux3 libwebpdemux2 libtiff-dev gtk-doc-tools autotools-dev autoconf libtool gobject-introspection
 
 build-pi: clean
 	mkdir -p ${DIST}/usr/local
@@ -38,3 +36,9 @@ release-linux-armhf:
 	cp /usr/local/lib/libheif* ${DIST}/usr/local/lib/
 	dpkg-deb --build dist
 	mv dist.deb lomo-vips-linux-armhf.deb
+
+release-linux-arm64:
+	cp -r linux-arm64/DEBIAN ${DIST}
+	cp /usr/local/lib/libheif* ${DIST}/usr/local/lib/
+	dpkg-deb --build dist
+	mv dist.deb lomo-vips-linux-arm64.deb
